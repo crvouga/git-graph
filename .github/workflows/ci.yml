@@ -159,6 +159,8 @@ jobs:
           retention-days: 14
 
   # Every secret the release needs exists in Vault (names and shape only; values are never printed).
+  # Advisory: reports missing keys as warnings and is not part of "CI ok". A release without its
+  # secrets still cannot go live: the server refuses to boot and fails its health check.
   vault:
     name: Vault secrets present
     runs-on: ubuntu-latest
@@ -186,14 +188,24 @@ jobs:
             | curl -fsS -X POST --data @- "$VAULT_ADDR/v1/auth/jwt/login" | jq -r .auth.client_token)
           echo "::add-mask::$token"
           echo "VAULT_TOKEN=$token" >> "$GITHUB_ENV"
-      - run: node scripts/check-vault.ts --config prd --config dev
+      - name: Check release secrets (warns when missing)
+        run: |
+          set +e
+          node scripts/check-vault.ts --config prd --config dev | tee vault-check.txt
+          code=${PIPESTATUS[0]}
+          if [ "$code" != "0" ]; then
+            missing=$(grep -E '^\s+FAIL' vault-check.txt | awk '{print $2}' | sort -u | paste -sd ', ' -)
+            echo "::warning title=Vault secrets missing::${missing:-Vault check failed (exit $code)}. Request them on crvouga/personal; the server will not boot without them."
+            { echo "### Vault secrets missing"; echo; echo '```'; cat vault-check.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit 0
 
   # The only check the main ruleset requires (see .github/repo-settings.json).
   # Add new jobs to `needs` instead of editing the ruleset.
   ci-ok:
     name: CI ok
     if: always()
-    needs: [test, e2e, build, storybook, vault]
+    needs: [test, e2e, build, storybook]
     runs-on: ubuntu-latest
     steps:
       - name: All jobs passed

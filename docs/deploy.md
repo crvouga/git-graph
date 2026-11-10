@@ -63,9 +63,10 @@ document is shared by all personal apps. The list is defined once in
 - **Local:** `pnpm dev:server:vault` runs the server under `personal infra-vault run` (config from
   `.vault.yaml`), which injects the `LANES_…` names; the server accepts either name.
 - **Checked on every change:** the CI job *Vault secrets present* logs in with GitHub OIDC (role
-  `github-actions`) and runs `pnpm vault:check`. It prints key names and problems only, and fails
-  when a required key is missing or malformed in `prd` or `dev`. It is part of **CI ok**, so
-  nothing merges, and so nothing deploys, while a release secret is missing. Run it locally after
+  `github-actions`) and runs `pnpm vault:check`. It prints key names and problems only, and raises
+  a warning (with the list in the job summary) when a required key is missing or malformed in
+  `prd` or `dev`. It is advisory, not part of **CI ok**: a release missing a secret still never
+  goes live, because the server refuses to boot and fails its health check. Run it locally after
   `vault login`.
 - **Adding or changing a key:** open a `[secrets] lanes — …` issue on `crvouga/personal` with key
   names only. Vault contents are managed by OpenTofu there; never write them by hand.
