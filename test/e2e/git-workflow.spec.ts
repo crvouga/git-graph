@@ -144,7 +144,11 @@ test("worktree → stage one hunk → commit → diff → compare → push → s
 });
 
 test("conflict: inspect, resolve, stage and continue", async ({ page }) => {
-  const s = state();
+  const s0 = state();
+  // Fresh mid-merge repository per run, so the test is repeatable and isolated.
+  const caseRoot = join(s0.fixturesRoot, `continue-case-${Date.now()}`);
+  mkdirSync(caseRoot, { recursive: true });
+  const s = { ...s0, conflict: makeConflict(caseRoot) };
   const { url } = openLocal(s.conflict);
   await page.goto(url);
   await waitForGraph(page, 3);
@@ -178,14 +182,16 @@ test("conflict: inspect, resolve, stage and continue", async ({ page }) => {
     }
   };
   await expect.poll(merging, { timeout: 10_000 }).toBe(false);
-  await expect(page.getByRole("alert").filter({ hasText: "merge in progress" })).toBeHidden();
+  // Both the banner and the details-panel notice must go away (count, so it waits for all of them).
+  await expect(page.getByRole("alert").filter({ hasText: /merge in progress/i })).toHaveCount(0);
   expect(git(s.conflict, ["log", "-1", "--format=%P"]).trim().split(" ")).toHaveLength(2);
 });
 
 test("conflict: abort restores the previous state", async ({ page }) => {
   const s = state();
-  mkdirSync(join(s.fixturesRoot, "abort-case"), { recursive: true });
-  const repo = makeConflict(join(s.fixturesRoot, "abort-case"));
+  const caseRoot = join(s.fixturesRoot, `abort-case-${Date.now()}`);
+  mkdirSync(caseRoot, { recursive: true });
+  const repo = makeConflict(caseRoot);
   const before = git(repo, ["rev-parse", "HEAD"]).trim();
   const { url } = openLocal(repo);
   await page.goto(url);
