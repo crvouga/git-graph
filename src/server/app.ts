@@ -10,8 +10,13 @@ import { AppError, type SyncStatus } from "../core/types.ts";
 import { PublicityCache } from "../github/adapter.ts";
 import { GitHubClient } from "../github/client.ts";
 import { HistoryStateCache } from "../github/history.ts";
+import { AccountStore } from "./accounts.ts";
 import { Auth } from "./auth.ts";
 import type { ServerConfig } from "./config.ts";
+import { connectDb, type Db } from "./db.ts";
+import { migrate } from "./migrations.ts";
+import { Oidc } from "./oidc.ts";
+import { TokenBox } from "./token-box.ts";
 import { GitHubResolver, makeAdapter, parseGitHubKey, type GitHubEnv } from "./resolver.ts";
 import { clientIp, csrfGuard, errorResponse, rateLimit, securityHeaders, TokenBuckets } from "./security.ts";
 import { SessionStore } from "./session.ts";
@@ -32,6 +37,10 @@ export interface ServerApp {
   reconciler: Reconciler;
   poller: Poller;
   webhooks: Webhooks;
+  db: Db | null;
+  accounts: AccountStore | null;
+  /** Resolves when the database is migrated (immediately without a database). */
+  ready(): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -55,15 +64,43 @@ export function createServerApp(config: ServerConfig): ServerApp {
     absoluteTtlMs: config.sessionAbsoluteTtlMs,
   });
 
+  // Durable state: PostgreSQL (accounts, connected GitHub). Everything else is in memory.
+  const signInConfigured = !!(config.oidc && config.databaseUrl && config.tokenEncryptionKey);
+  const db = signInConfigured ? connectDb(config.databaseUrl!, { schema: config.databaseSchema, max: config.databasePoolMax }) : null;
+  const accounts = db ? new AccountStore(db, new TokenBox(config.tokenEncryptionKey!)) : null;
+  const oidc = signInConfigured ? new Oidc({ ...config.oidc!, fetch: config.fetch }) : null;
+  // Migrate at boot, retrying with back-off: a database outage must not crash-loop the server
+  // (the health check never touches the database); sign-in waits for it instead.
+  let closed = false;
+  let readyResolve!: () => void;
+  const readyPromise = new Promise<void>((r) => (readyResolve = r));
+  if (!db || !config.migrateOnBoot) readyResolve();
+  else {
+    void (async () => {
+      for (let attempt = 0; !closed; attempt++) {
+        try {
+          const applied = await migrate(db);
+          log("info", "database ready", { schema: db.schema, applied });
+          readyResolve();
+          return;
+        } catch (e) {
+          const wait = Math.min(60_000, 1000 * 2 ** attempt);
+          log("error", "database migration failed; retrying", { error: e instanceof Error ? e.message : String(e), retryInMs: wait });
+          await new Promise((r) => setTimeout(r, wait).unref?.());
+        }
+      }
+    })();
+  }
+  const ready = () =>
+    Promise.race([readyPromise, new Promise<never>((_, rej) => setTimeout(() => rej(new AppError("OFFLINE", "The database is not ready yet")), 10_000).unref?.())]);
+
   // Late-bound to break the construction cycle (client → auth → client).
   let auth: Auth | null = null;
   const github = new GitHubClient({
     apiUrl: config.githubApiUrl,
     webUrl: config.githubWebUrl,
     fetch: fetchFn,
-    onUnauthorized: (tid) => {
-      for (const s of sessions.findByTokenId(tid)) auth?.endSession(s, "GitHub rejected the token");
-    },
+    onUnauthorized: (tid) => void auth?.tokenRejected(tid),
   });
   const historyCache = new HistoryStateCache(256, 2_000_000);
   const publicity = new PublicityCache();
@@ -107,14 +144,17 @@ export function createServerApp(config: ServerConfig): ServerApp {
   const authInst = new Auth({
     config,
     sessions,
+    accounts,
+    oidc,
     github,
     fetch: fetchFn,
     now,
     log,
-    onSessionEnded: (s, userId) => {
-      // Only this session's streams: the same user may be signed in elsewhere.
-      void userId;
-      registry.revoke((p) => !!p && p.sessionKey === s.key);
+    ready,
+    // Only this session's streams: the same person may be signed in elsewhere.
+    onSessionEnded: (s) => registry.revoke((p) => !!p && p.sessionKey === s.key),
+    onGitHubDisconnected: (githubUserId, accountId) => {
+      registry.revoke((p) => !!p && (p.userId === githubUserId || (accountId !== null && p.accountId === accountId)));
     },
   });
   auth = authInst;
@@ -139,20 +179,15 @@ export function createServerApp(config: ServerConfig): ServerApp {
     onActivity: (repo) => poll.bump(repo),
     onUserRevoked: (userId, login) => {
       log("info", "app authorization revoked", { login });
-      for (const s of sessions.findByUserId(userId)) authInst.endSession(s, "app authorization revoked");
-      sessions.revokeUser(userId); // also sessions this process has not seen since it started
+      // The person stays signed in to Lanes; their GitHub connection is gone.
+      void accounts?.unlinkGitHubUser(userId).catch((e) => log("error", "unlink after revocation failed", { error: e instanceof Error ? e.message : String(e) }));
       registry.revoke((p) => p?.userId === userId);
     },
   });
 
-  const principalOf = (c: Context): Principal => {
-    const existing = c.get("principal") as Principal | undefined;
-    if (existing) return existing;
-    const s = authInst.readSession(c);
-    const p: Principal = { sessionKey: s?.key ?? null, userId: s?.user?.id ?? null, token: () => authInst.accessToken(s) };
-    c.set("principal", p);
-    return p;
-  };
+  const ANONYMOUS: Principal = { sessionKey: null, accountId: null, userId: null, token: async () => null };
+  /** Set by the /api middleware (resolving it reads the account). */
+  const principalOf = (c: Context): Principal => (c.get("principal") as Principal | undefined) ?? ANONYMOUS;
 
   /** One resolver per request, so the adapter (and its memoized access check) is shared. */
   const resolverOf = (c: Context): GitHubResolver => {
@@ -174,7 +209,7 @@ export function createServerApp(config: ServerConfig): ServerApp {
   const authBuckets = new TokenBuckets(config.authRateLimit.capacity, config.authRateLimit.refillPerSec);
   const rlKey = (c: Context) => {
     const s = authInst.readSession(c);
-    return s?.user ? `s:${s.key}` : `ip:${clientIp(c, config.trustProxy)}`;
+    return s?.accountId ? `s:${s.key}` : `ip:${clientIp(c, config.trustProxy)}`;
   };
 
   app.use("*", securityHeaders(config.appOrigin));
@@ -202,7 +237,11 @@ export function createServerApp(config: ServerConfig): ServerApp {
   app.use("/api/*", csrfGuard(config.appOrigin));
   app.use("/api/*", rateLimit(apiBuckets, rlKey, "api"));
   app.use("/api/*", bodyLimit({ maxSize: 10 * 1024 * 1024, onError: (c) => errorResponse(c, new AppError("BAD_REQUEST", "Request body too large")) }));
-  app.use("/api/*", (c, next) => registry.als.run(principalOf(c), () => next()));
+  app.use("/api/*", async (c, next) => {
+    const p = await authInst.principal(c);
+    c.set("principal", p);
+    return registry.als.run(p, () => next());
+  });
 
   app.get("/api/v1/session", (c) => authInst.sessionInfo(c));
 
@@ -277,10 +316,15 @@ export function createServerApp(config: ServerConfig): ServerApp {
     reconciler: rec,
     poller: poll,
     webhooks,
+    db,
+    accounts,
+    ready: () => readyPromise,
     async close() {
+      closed = true;
       poll.close();
       rec.close();
       webhooks.close();
+      await db?.close();
     },
   };
 }

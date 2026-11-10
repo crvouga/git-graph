@@ -1,4 +1,5 @@
 import { createSignal, For, onCleanup, onMount, Show } from "solid-js";
+import { canConnectGitHub } from "./app/account.ts";
 import { app } from "./app/store.ts";
 import { currentContext, invoke, openGitHubInput, registry, shortcutCommands } from "./app/commands.ts";
 import { isTypingTarget, matches, formatShortcut } from "./app/platform.ts";
@@ -78,9 +79,14 @@ export function Home() {
               Open folder (read-only)…
             </button>
           </Show>
-          <Show when={app.auth.serverAvailable && !app.auth.authenticated}>
+          <Show when={app.auth.serverAvailable && app.auth.loginEnabled && !app.auth.authenticated}>
             <button class="rounded border border-[var(--border)] px-2 py-1" onClick={() => invoke("account.signIn")}>
-              Sign in with GitHub
+              Sign in
+            </button>
+          </Show>
+          <Show when={canConnectGitHub(app.auth)}>
+            <button class="rounded border border-[var(--border)] px-2 py-1" onClick={() => invoke("account.connectGitHub")}>
+              Connect GitHub
             </button>
           </Show>
         </div>
@@ -151,11 +157,19 @@ export function Banners() {
         <div class="m-6 max-w-[640px] rounded border border-[var(--del)] p-4" role="alert">
           <div class="font-bold">{err()!.code === "NOT_FOUND" ? "Repository not found" : err()!.code === "UNAUTHENTICATED" ? "Connection needed" : err()!.code === "FORBIDDEN" ? "Access denied" : "Could not open repository"}</div>
           <div class="mt-1 whitespace-pre-wrap">{err()!.message}</div>
-          <Show when={err()!.code === "NOT_FOUND" && app.view().repo?.provider === "github" && !app.auth.authenticated && app.auth.serverAvailable}>
+          <Show when={err()!.code === "NOT_FOUND" && app.view().repo?.provider === "github" && app.auth.serverAvailable && app.auth.loginEnabled && !app.auth.authenticated}>
             <div class="mt-2">
-              Private repositories need you to sign in.{" "}
+              Private repositories need you to sign in and connect GitHub.{" "}
               <a class="text-link underline" href={app.loginUrl()}>
-                Sign in with GitHub
+                Sign in
+              </a>
+            </div>
+          </Show>
+          <Show when={(err()!.code === "NOT_FOUND" || err()!.code === "UNAUTHENTICATED") && app.view().repo?.provider === "github" && canConnectGitHub(app.auth)}>
+            <div class="mt-2">
+              Connect your GitHub account to see private repositories.{" "}
+              <a class="text-link underline" href={app.githubConnectUrl()}>
+                Connect GitHub
               </a>
             </div>
           </Show>

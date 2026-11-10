@@ -31,5 +31,5 @@ test("opens a local repository through the companion and renders the real graph"
 test("opens a public GitHub repository anonymously", async ({ page }) => {
   await page.goto(`${state().appOrigin}/github/octo/basic`);
   await waitForGraph(page, 5);
-  await expect(page.getByRole("button", { name: "Sign in with GitHub" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Sign in", exact: true })).toBeVisible();
 });

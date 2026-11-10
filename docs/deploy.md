@@ -3,22 +3,53 @@
 The hosted server (`src/server/main.ts`, bundled to `dist/server/server.mjs`) serves:
 
 - the web app (static files from `STATIC_DIR`, with SPA fallback),
-- GitHub sign-in (`/auth/login`, `/auth/callback`, `POST /auth/logout`),
+- sign-in through the shared auth relay (`/auth/login`, `/auth/callback`, `POST /auth/logout`),
+- connecting a GitHub account (`/auth/github/connect`, `/auth/github/callback`,
+  `POST /auth/github/disconnect`),
 - the shared API at `/api/v1` (GitHub repositories only; local repositories are served by the
   `git-graph` CLI companion on the user's machine),
 - GitHub webhooks at `POST /webhooks/github`,
 - real-time updates over Server-Sent Events (`/api/v1/repositories/:id/events`),
 - `GET /health`.
 
-It is a single, stateless Node process: no database, no volume, nothing written to disk.
+It is a single Node process with no local state: no volume, nothing written to disk. Durable
+data lives in the shared PostgreSQL; the container can be replaced at any time.
 
-- **Sessions** live in the browser as one sealed cookie (AES-256-GCM, key derived from
-  `SESSION_SECRET`). The browser cannot read or change it, and any server with the same secret
-  can read it, so sessions survive restarts and redeploys.
+- **Accounts** (PostgreSQL, schema `lanes`): one row per person, keyed by the auth relay's
+  `(issuer, subject)` (never by email), and their connected GitHub account. GitHub user-to-server
+  tokens are stored encrypted (AES-256-GCM, `TOKEN_ENCRYPTION_KEY`, bound to their row), refreshed
+  by the server, and never sent to the browser. One GitHub account connects to one Lanes account.
+- **Sessions** live in the browser as one sealed cookie (AES-256-GCM, key from `SESSION_SECRET`)
+  holding the account id and in-flight sign-ins. They survive restarts and redeploys.
 - **Everything else is an in-memory cache** that is safe to lose: the event hub, the poller, the
   GitHub response cache, recent webhook delivery ids, recently seen sessions and ended session ids.
   After a restart, clients reconnect and resync; a webhook redelivered across a restart is
   processed again, which is safe because processing is idempotent.
+
+### Sign-in and GitHub
+
+1. **Sign in** with Google through the shared auth relay (`https://auth.chrisvouga.dev`): OpenID
+   Connect authorization code flow as a public client (S256 PKCE, single-use state and nonce bound
+   to the browser, ten minutes, separate per tab). The ID token's signature, issuer, audience,
+   nonce and expiry are verified (`openid-client`).
+2. **Connect GitHub**: the GitHub App's OAuth flow links a GitHub account to the signed-in account.
+   From then on the person sees their private repositories, with live sync, on any device they
+   sign in on. Disconnecting (or revoking the App on GitHub, or GitHub rejecting the token)
+   removes the link; the Lanes session stays.
+
+### PostgreSQL
+
+- `DATABASE_URL` (Vault, shared key) is opaque and passed to the driver unchanged; it is never
+  logged. Lanes touches only its allocated schema (`DATABASE_SCHEMA`, default `lanes`); the
+  schema is allocated by `crvouga/personal`, never created by the app.
+- Raw, parameterized SQL (`postgres` driver) over a pool of `DATABASE_POOL_MAX` (5) connections
+  with a 30 s statement timeout. Migrations (`src/server/migrations.ts`) are append-only and
+  additive; they run at boot (`MIGRATE_ON_BOOT`, default on) under an advisory lock, and with
+  `pnpm db:migrate` (`pnpm db:migrate:vault` for dev).
+- `/health` never touches the database. If it is down at boot, the server keeps serving public
+  repositories and retries migrations with back-off; sign-in answers "unavailable" meanwhile.
+- Tests use a disposable PostgreSQL (PGlite) with a fresh schema per test server, never the
+  shared dev database.
 
 ## Production: `lanes.chrisvouga.dev`
 
@@ -38,7 +69,9 @@ running a prebuilt public image.
 | --- | --- |
 | Port | `8787` (`PORT`) |
 | Health check | `GET /health` → 200, no auth, no GitHub calls |
-| Plain env | `PORT=8787`, `APP_ORIGIN=https://lanes.chrisvouga.dev`, `TRUST_PROXY=1`, `GITHUB_APP_SLUG=<slug>` |
+| Plain env | `PORT=8787`, `APP_ORIGIN=https://lanes.chrisvouga.dev`, `TRUST_PROXY=1`, `GITHUB_APP_SLUG=<slug>`, `OIDC_ISSUER=https://auth.chrisvouga.dev/realms/projects`, `OIDC_CLIENT_ID=<from relay registration>` |
+| Database | schema `lanes` (dev and prd), `DATABASE_URL` from Vault |
+| Relay client | `tools/auth-relay/registration.production.json`, registered with `pnpm relay:register:production` (see [tools/auth-relay/README.md](../tools/auth-relay/README.md)) |
 | Secrets | from Vault, see below |
 | Replicas | exactly 1 |
 
@@ -55,6 +88,8 @@ document is shared by all personal apps. The list is defined once in
 | `LANES_GITHUB_CLIENT_ID` | `GITHUB_CLIENT_ID` | yes | GitHub App → Client ID |
 | `LANES_GITHUB_CLIENT_SECRET` | `GITHUB_CLIENT_SECRET` | yes | GitHub App → Generate a new client secret |
 | `LANES_GITHUB_WEBHOOK_SECRET` | `GITHUB_WEBHOOK_SECRET` | yes | the App's webhook secret (`openssl rand -hex 32`) |
+| `LANES_TOKEN_ENCRYPTION_KEY` | `TOKEN_ENCRYPTION_KEY` | yes | `openssl rand -base64 48`; keep it stable (rotating disconnects every GitHub link) |
+| `DATABASE_URL` | `DATABASE_URL` | yes | shared key, already in Vault |
 | `LANES_GITHUB_PUBLIC_TOKEN` | `GITHUB_PUBLIC_TOKEN` | no | fine-grained token with no repository access |
 
 - **Production:** the service's inventory entry in `crvouga/personal` binds each runtime name to
@@ -74,8 +109,9 @@ document is shared by all personal apps. The list is defined once in
   misconfigured release fails its health check instead of going live. `ALLOW_ANONYMOUS_ONLY=1`
   allows a deliberately sign-in-free deployment.
 
-The GitHub App's callback URL is `https://lanes.chrisvouga.dev/auth/callback` and its webhook URL
-is `https://lanes.chrisvouga.dev/webhooks/github`.
+The GitHub App's callback URL is `https://lanes.chrisvouga.dev/auth/github/callback` and its
+webhook URL is `https://lanes.chrisvouga.dev/webhooks/github`. The relay client's callback is
+`https://lanes.chrisvouga.dev/auth/callback`.
 
 Redeploy a given commit (a human, from a machine with access to `crvouga/personal`):
 `gh workflow run deploy.yml -R crvouga/personal -f action=deploy -f service_id=lanes -f image_tag=<sha>`.
@@ -165,7 +201,15 @@ location / {
 | `PORT` | `8787` | HTTP port. |
 | `HOST` | `0.0.0.0` | Bind address. |
 | `APP_ORIGIN` | `http://localhost:$PORT` | Public origin (scheme+host[+port]). OAuth redirect, CSRF, cookies, HSTS. |
-| `NODE_ENV` | `production` in the image | `production` requires `APP_ORIGIN`, `SESSION_SECRET` and the GitHub App variables. |
+| `NODE_ENV` | `production` in the image | `production` requires `APP_ORIGIN`, `SESSION_SECRET`, the relay, database and GitHub App variables. |
+| `OIDC_ISSUER` | — | Auth relay issuer: `https://auth.chrisvouga.dev/realms/projects` (production) or `https://auth-dev.chrisvouga.dev/realms/projects-dev`. |
+| `OIDC_CLIENT_ID` | — | Public client id from the relay registration (`app-<uuid>`). |
+| `OIDC_REDIRECT_URI` | `$APP_ORIGIN/auth/callback` | Must equal the registered callback. |
+| `OIDC_SCOPES` / `OIDC_IDP_HINT` | `openid email profile` / `google` | |
+| `DATABASE_URL` | — | Opaque PostgreSQL URL (Vault). Required with sign-in. |
+| `DATABASE_SCHEMA` / `DATABASE_POOL_MAX` | `lanes` / `5` | Allocated schema; pool size. |
+| `MIGRATE_ON_BOOT` | `1` | `0` to run `pnpm db:migrate` separately. |
+| `TOKEN_ENCRYPTION_KEY` | — | ≥ 32 bytes. Encrypts stored GitHub tokens. |
 | `ALLOW_ANONYMOUS_ONLY` | — | `1`: allow production without the GitHub App (public repositories only, no webhooks). |
 | `SESSION_SECRET` | random (dev only) | ≥ 32 bytes. Encrypts the session cookie. Rotating it signs everyone out. |
 | `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | — | GitHub App (or OAuth App) credentials. Without them: anonymous, public repos only. |

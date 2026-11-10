@@ -1,37 +1,23 @@
-// Stateless sessions. The whole session lives in the browser as an AES-256-GCM sealed cookie
-// (key derived from SESSION_SECRET), so the server keeps nothing on disk and survives restarts and
-// redeploys without a database. The browser cannot read or forge it: GitHub tokens inside stay
-// confidential, and a tampered cookie fails authentication and is ignored.
+// Sessions as sealed cookies. The session lives in the browser as an AES-256-GCM sealed cookie
+// (key derived from SESSION_SECRET): who is signed in (an account id) and the in-flight sign-in
+// transactions. The browser cannot read or forge it, and no session table is needed. Durable data
+// (accounts, linked GitHub tokens) lives in PostgreSQL, never in the cookie.
 //
-// The server also keeps small in-memory caches. They are an optimization and a safety net, never
-// the source of truth, so losing them on restart is harmless:
-//  - the latest copy of recently seen sessions, so a token refresh that happens where no cookie
-//    can be written (a background poll, an open event stream) is not lost before the next request;
-//  - ended session ids (logout, revocation) until they would have expired anyway, so an old copy
-//    of the cookie stops working in this process. After a restart, GitHub rejecting the token ends
-//    the session again.
+// The server also keeps small in-memory caches, a safety net that is harmless to lose:
+//  - the latest copy of recently seen sessions, so a change made where no cookie can be written
+//    (or a replayed older cookie) does not resurrect consumed state;
+//  - ended session ids (logout) until they would have expired anyway, so an old copy of the
+//    cookie stops working in this process.
 
 import { createCipheriv, createDecipheriv, hkdfSync, randomBytes } from "node:crypto";
-import { tokenIdentity } from "../github/client.ts";
 
-export interface SessionUser {
-  id: number;
-  login: string;
-  name: string | null;
-  avatarUrl: string | null;
-}
-
-export interface GitHubTokens {
-  accessToken: string;
-  /** Unix ms; null for non-expiring OAuth App tokens. */
-  accessTokenExpiresAt: number | null;
-  refreshToken: string | null;
-  refreshTokenExpiresAt: number | null;
-}
-
-export interface PendingLogin {
+/** One in-flight sign-in (relay login or GitHub connect); single use, ten minutes. */
+export interface PendingAuth {
+  kind: "login" | "github";
   state: string;
   verifier: string;
+  /** OIDC only. */
+  nonce: string | null;
   returnTo: string;
   createdAt: number;
 }
@@ -44,9 +30,10 @@ export interface Session {
   createdAt: number;
   lastSeenAt: number;
   signedInAt: number | null;
-  user: SessionUser | null;
-  github: GitHubTokens | null;
-  pending: PendingLogin | null;
+  /** Signed-in account (accounts.id), or null. */
+  accountId: string | null;
+  /** Separate entries per tab; oldest dropped first. */
+  pending: PendingAuth[];
 }
 
 export interface SessionStoreOptions {
@@ -77,8 +64,6 @@ export class SessionStore {
   private readonly recent = new Map<string, Session>();
   /** Session id → when it would have expired anyway. */
   private readonly ended = new Map<string, number>();
-  /** User id → when the user revoked the app. Sessions signed in before that are over. */
-  private readonly usersRevokedAt = new Map<number, number>();
 
   constructor(opts: SessionStoreOptions) {
     this.opts = opts;
@@ -94,7 +79,7 @@ export class SessionStore {
 
   create(): Session {
     const t = this.now();
-    const s: Session = { key: randomBytes(18).toString("base64url"), rev: 1, createdAt: t, lastSeenAt: t, signedInAt: null, user: null, github: null, pending: null };
+    const s: Session = { key: randomBytes(18).toString("base64url"), rev: 1, createdAt: t, lastSeenAt: t, signedInAt: null, accountId: null, pending: [] };
     this.remember(s);
     return s;
   }
@@ -133,7 +118,7 @@ export class SessionStore {
       d.setAAD(Buffer.from(VERSION));
       d.setAuthTag(buf.subarray(12, 28));
       const s = JSON.parse(Buffer.concat([d.update(buf.subarray(28)), d.final()]).toString("utf8")) as Session;
-      return typeof s?.key === "string" && typeof s.rev === "number" ? s : null;
+      return typeof s?.key === "string" && typeof s.rev === "number" && Array.isArray(s.pending) ? s : null;
     } catch {
       return null; // tampered, or SESSION_SECRET rotated
     }
@@ -154,32 +139,13 @@ export class SessionStore {
 
   destroy(s: Session): void {
     this.end(s.key);
-    s.user = null;
-    s.github = null;
-    s.pending = null;
+    s.accountId = null;
+    s.pending = [];
     s.rev++;
   }
 
   isEnded(s: Session): boolean {
-    if (this.ended.has(s.key)) return true;
-    const revokedAt = s.user ? this.usersRevokedAt.get(s.user.id) : undefined;
-    return revokedAt !== undefined && (s.signedInAt ?? 0) <= revokedAt;
-  }
-
-  /** The user revoked the app: every session they signed in before now is over. */
-  revokeUser(userId: number): void {
-    this.usersRevokedAt.set(userId, this.now());
-    if (this.usersRevokedAt.size > this.cacheSize) this.usersRevokedAt.delete(this.usersRevokedAt.keys().next().value!);
-  }
-
-  /** Recently seen sessions whose GitHub token has this identity. */
-  findByTokenId(tid: string): Session[] {
-    return [...this.recent.values()].filter((s) => s.github && tokenIdentity(s.github.accessToken) === tid);
-  }
-
-  /** Recently seen sessions of this user. */
-  findByUserId(id: number): Session[] {
-    return [...this.recent.values()].filter((s) => s.user?.id === id);
+    return this.ended.has(s.key);
   }
 
   private end(key: string) {

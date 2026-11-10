@@ -1,7 +1,8 @@
 import type { Meta, StoryObj } from "storybook-solidjs-vite";
 import { app } from "../app/store.ts";
 import type { SyncInfo } from "../engine/protocol.ts";
-import { Frame, freezeEngine, openFixture, openHome } from "../storybook/harness.tsx";
+import { expect } from "storybook/test";
+import { Frame, freezeEngine, openFixture, openHome, setSession } from "../storybook/harness.tsx";
 import { ControlBar } from "./ControlBar.tsx";
 
 const meta = {
@@ -33,3 +34,40 @@ export const SyncProblem: Story = { beforeEach: withSync({ connection: "polling"
 export const Offline: Story = { beforeEach: withSync({ connection: "offline", lastError: "Network unreachable" }) };
 export const FilteredToOneBranch: Story = { beforeEach: () => openFixture({ branches: ["develop"] }) };
 export const FilteredToSeveralBranches: Story = { beforeEach: () => openFixture({ branches: ["develop", "main", "feature/auth"] }) };
+
+/** A Lanes server with sign-in: anonymous visitors see "Sign in". */
+export const SignedOut: Story = {
+  beforeEach: async () => {
+    await openFixture();
+    setSession("signed-out");
+  },
+  play: async ({ canvas }) => {
+    await expect(await canvas.findByRole("button", { name: /^Sign in$/ })).toBeVisible();
+    await expect(canvas.queryByRole("button", { name: "Connect GitHub" })).toBeNull();
+  },
+};
+
+/** Signed in through the relay; GitHub not connected yet: offer to connect it. */
+export const SignedInGitHubNotConnected: Story = {
+  beforeEach: async () => {
+    await openFixture();
+    setSession("signed-in");
+  },
+  play: async ({ canvas }) => {
+    await expect(await canvas.findByRole("button", { name: "Connect GitHub" })).toBeVisible();
+    await expect(canvas.getByRole("button", { name: /Account: Alice Example, GitHub not connected/ })).toBeVisible();
+    await expect(canvas.queryByRole("button", { name: /^Sign in$/ })).toBeNull();
+  },
+};
+
+/** Signed in with GitHub connected: just the account button, showing the GitHub avatar. */
+export const SignedInGitHubConnected: Story = {
+  beforeEach: async () => {
+    await openFixture();
+    setSession("github-connected");
+  },
+  play: async ({ canvas }) => {
+    await expect(await canvas.findByRole("button", { name: /Account: Alice Example, GitHub @alice/ })).toBeVisible();
+    await expect(canvas.queryByRole("button", { name: "Connect GitHub" })).toBeNull();
+  },
+};

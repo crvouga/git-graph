@@ -39,6 +39,16 @@ export interface ServerConfig {
   githubWebUrl: string;
   publicToken: string | null;
   oauthScopes: string;
+  /** Auth relay (OIDC) sign-in. Enabled when issuer, client id, database and token key are set. */
+  oidc: { issuer: string; clientId: string; redirectUri: string; scopes: string; idpHint: string } | null;
+  /** Opaque PostgreSQL connection URL (Vault DATABASE_URL). Never logged. */
+  databaseUrl: string | null;
+  /** Lanes' allocated schema. */
+  databaseSchema: string;
+  databasePoolMax: number;
+  migrateOnBoot: boolean;
+  /** Encrypts GitHub tokens stored in PostgreSQL (≥ 32 bytes). */
+  tokenEncryptionKey: string | null;
   staticDir: string;
   /** Number of trusted reverse-proxy hops for X-Forwarded-For (0 = ignore the header). */
   trustProxy: number;
@@ -81,13 +91,20 @@ export function loadConfig(rawEnv: NodeJS.ProcessEnv = process.env): ServerConfi
     if (production) throw new Error("SESSION_SECRET (Vault LANES_SESSION_SECRET) must be set to at least 32 bytes in production (e.g. `openssl rand -base64 48`)");
     sessionSecret = randomBytes(48).toString("base64");
   }
-  // Sign-in needs both halves; a deploy missing either is broken, not "anonymous".
-  if (!!env.GITHUB_CLIENT_ID !== !!env.GITHUB_CLIENT_SECRET) {
-    throw new Error(`${env.GITHUB_CLIENT_ID ? "GITHUB_CLIENT_SECRET" : "GITHUB_CLIENT_ID"} is missing (both GitHub App credentials are needed for sign-in)`);
+  // Each integration needs all of its parts; a deploy with only some is broken, not "anonymous".
+  const groups: [string, string[]][] = [
+    ["GitHub App", ["GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET"]],
+    ["auth relay sign-in", ["OIDC_ISSUER", "OIDC_CLIENT_ID", "DATABASE_URL", "TOKEN_ENCRYPTION_KEY"]],
+  ];
+  for (const [what, keys] of groups) {
+    const set = keys.filter((k) => env[k]);
+    if (set.length && set.length < keys.length) throw new Error(`${keys.filter((k) => !env[k]).join(", ")} missing: ${what} needs ${keys.join(", ")}`);
   }
+  if (env.OIDC_ISSUER && !env.GITHUB_CLIENT_ID) throw new Error("GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET missing: connecting GitHub needs the GitHub App");
+  if (env.TOKEN_ENCRYPTION_KEY && Buffer.byteLength(env.TOKEN_ENCRYPTION_KEY) < 32) throw new Error("TOKEN_ENCRYPTION_KEY (Vault LANES_TOKEN_ENCRYPTION_KEY) must be at least 32 bytes");
   if (production && !/^(1|true|yes)$/i.test(env.ALLOW_ANONYMOUS_ONLY ?? "")) {
-    const missing = ["GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET", "GITHUB_WEBHOOK_SECRET"].filter((k) => !env[k]);
-    if (missing.length) throw new Error(`${missing.join(", ")} must be set in production (from Vault LANES_${missing[0]}), or set ALLOW_ANONYMOUS_ONLY=1 to run without sign-in and webhooks`);
+    const missing = ["OIDC_ISSUER", "OIDC_CLIENT_ID", "DATABASE_URL", "TOKEN_ENCRYPTION_KEY", "GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET", "GITHUB_WEBHOOK_SECRET"].filter((k) => !env[k]);
+    if (missing.length) throw new Error(`${missing.join(", ")} must be set in production (see docs/deploy.md), or set ALLOW_ANONYMOUS_ONLY=1 to run without sign-in and webhooks`);
   }
   const tp = (env.TRUST_PROXY ?? "").trim().toLowerCase();
   const trustProxy = tp === "true" || tp === "yes" ? 1 : tp === "false" || tp === "" ? 0 : Math.max(0, Math.floor(num(tp, 0)));
@@ -105,6 +122,20 @@ export function loadConfig(rawEnv: NodeJS.ProcessEnv = process.env): ServerConfi
     githubWebUrl: (env.GITHUB_WEB_URL || "https://github.com").replace(/\/+$/, ""),
     publicToken: env.GITHUB_PUBLIC_TOKEN || null,
     oauthScopes: env.GITHUB_OAUTH_SCOPES ?? "read:user",
+    oidc: env.OIDC_ISSUER
+      ? {
+          issuer: env.OIDC_ISSUER.replace(/\/+$/, ""),
+          clientId: env.OIDC_CLIENT_ID!,
+          redirectUri: env.OIDC_REDIRECT_URI || `${appOrigin}/auth/callback`,
+          scopes: env.OIDC_SCOPES || "openid email profile",
+          idpHint: env.OIDC_IDP_HINT ?? "google",
+        }
+      : null,
+    databaseUrl: env.DATABASE_URL || null,
+    databaseSchema: env.DATABASE_SCHEMA || "lanes",
+    databasePoolMax: num(env.DATABASE_POOL_MAX, 5),
+    migrateOnBoot: !/^(0|false|no)$/i.test(env.MIGRATE_ON_BOOT ?? ""),
+    tokenEncryptionKey: env.TOKEN_ENCRYPTION_KEY || null,
     staticDir: resolve(process.cwd(), env.STATIC_DIR || "dist/web"),
     trustProxy,
     sessionIdleTtlMs: num(env.SESSION_IDLE_TTL_HOURS, 24 * 7) * 3600_000,

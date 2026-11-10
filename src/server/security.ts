@@ -11,7 +11,7 @@ export function securityHeaders(appOrigin: string): MiddlewareHandler {
     "script-src 'self'",
     // Solid/Tailwind set inline style attributes for virtualized rows and graph lanes.
     "style-src 'self' 'unsafe-inline'",
-    "img-src 'self' data: blob: https://avatars.githubusercontent.com https://*.githubusercontent.com",
+    "img-src 'self' data: blob: https://avatars.githubusercontent.com https://*.githubusercontent.com https://*.googleusercontent.com", // GitHub and Google (relay sign-in) avatars
     "font-src 'self' data:",
     // The local CLI companion listens on loopback.
     "connect-src 'self' http://127.0.0.1:* http://localhost:*",

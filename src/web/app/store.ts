@@ -11,6 +11,25 @@ import { loadHandle } from "./handles.ts";
 import { address } from "./address.ts";
 import { IN_STORYBOOK } from "./env.ts";
 
+/** Signed in through the auth relay (Google). */
+export interface AuthUser {
+  name: string | null;
+  email: string | null;
+  avatarUrl: string | null;
+}
+/** The account's GitHub connection (private repositories, live sync). */
+export type AuthGitHub = { connected: true; login: string; name: string | null; avatarUrl: string | null } | { connected: false };
+export interface AuthState {
+  checked: boolean;
+  serverAvailable: boolean;
+  authenticated: boolean;
+  user: AuthUser | null;
+  github: AuthGitHub | null;
+  /** The server offers sign-in / connecting GitHub. */
+  loginEnabled: boolean;
+  githubEnabled: boolean;
+}
+
 // ---------------------------------------------------------------------------
 // Persistence helpers (localStorage is only used for per-user preferences, never credentials
 // for GitHub; the companion bearer token is a localhost-only secret stored per origin).
@@ -139,12 +158,14 @@ function createApp() {
     missingRefs: string[];
   }>({ info: null, caps: null, refs: null, status: null, sync: null, error: null, loading: false, missingRefs: [] });
 
-  const [auth, setAuth] = createStore<{ checked: boolean; serverAvailable: boolean; authenticated: boolean; user: { login: string; name?: string; avatarUrl?: string } | null; loginUrl: string }>({
+  const [auth, setAuth] = createStore<AuthState>({
     checked: false,
     serverAvailable: false,
     authenticated: false,
     user: null,
-    loginUrl: "/auth/login",
+    github: null,
+    loginEnabled: false,
+    githubEnabled: false,
   });
 
   const [companion, setCompanionSignal] = createSignal<CompanionConfig>(load("lanes.companion", { baseUrl: "http://127.0.0.1:7420", token: null }));
@@ -680,14 +701,17 @@ function createApp() {
       const res = await fetch("/api/v1/session", { credentials: "include", headers: { accept: "application/json" } });
       const ct = res.headers.get("content-type") ?? "";
       if (!res.ok || !ct.includes("json")) throw new Error("no server");
-      const s = (await res.json()) as { authenticated: boolean; user?: { login: string; name?: string; avatarUrl?: string } };
-      setAuth({ checked: true, serverAvailable: true, authenticated: s.authenticated, user: s.user ?? null });
+      const s = (await res.json()) as { authenticated: boolean; user?: AuthUser | null; github?: AuthGitHub | null; loginUrl?: string | null; githubConnectUrl?: string | null };
+      setAuth({ checked: true, serverAvailable: true, authenticated: s.authenticated, user: s.user ?? null, github: s.github ?? null, loginEnabled: !!s.loginUrl, githubEnabled: !!s.githubConnectUrl });
     } catch {
-      setAuth({ checked: true, serverAvailable: false, authenticated: false, user: null });
+      setAuth({ checked: true, serverAvailable: false, authenticated: false, user: null, github: null, loginEnabled: false, githubEnabled: false });
     }
   }
   function loginUrl() {
     return `/auth/login?returnTo=${encodeURIComponent(address.path())}`;
+  }
+  function githubConnectUrl() {
+    return `/auth/github/connect?returnTo=${encodeURIComponent(address.path())}`;
   }
 
   function setCompanion(c: CompanionConfig) {
@@ -796,8 +820,11 @@ function createApp() {
     repo,
     setRepo,
     auth,
+    /** Stories and tests only: pin the session state. */
+    setAuth,
     checkSession,
     loginUrl,
+    githubConnectUrl,
     companion,
     setCompanion,
     pairCompanion,

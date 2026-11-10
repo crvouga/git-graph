@@ -8,6 +8,7 @@
 //    describe which arguments still need to be asked for.
 
 import { z } from "zod";
+import { accountLabel, githubLogin } from "./account.ts";
 import { CommandRegistry, defineCommand, type AnyCommand, type MenuContext } from "../../core/commands/registry.ts";
 import { repoCommands } from "../../core/commands/repo-commands.ts";
 import { AppError, type MutationResult, type Ref, type Worktree, type Remote, type RepoInfo } from "../../core/types.ts";
@@ -678,19 +679,57 @@ function uiCommands(): UiCommand[] {
     ui({ id: "companion.disconnect", title: "Disconnect Local Companion", description: "Forget the companion token in this browser.", category: "Account", when: () => (app.companion().token ? { enabled: true } : { enabled: false, reason: "Not connected" }), execute: () => app.setCompanion({ ...app.companion(), token: null }) }),
     ui({
       id: "account.signIn",
-      title: "Sign in with GitHub",
-      description: "Authorize access to your private repositories.",
+      title: "Sign In",
+      description: "Sign in with Google to keep your GitHub connection across devices.",
       category: "Account",
       scope: "global",
-      when: () => (!app.auth.serverAvailable ? { enabled: false, reason: "No Lanes server is reachable (static hosting): GitHub sign-in needs the backend" } : app.auth.authenticated ? { enabled: false, reason: `Already signed in as ${app.auth.user?.login}` } : { enabled: true }),
+      when: () =>
+        !app.auth.serverAvailable
+          ? { enabled: false, reason: "No Lanes server is reachable (static hosting): sign-in needs the backend" }
+          : !app.auth.loginEnabled
+            ? { enabled: false, reason: "Sign-in is not configured on this server" }
+            : app.auth.authenticated
+              ? { enabled: false, reason: `Already signed in as ${accountLabel(app.auth)}` }
+              : { enabled: true },
       execute: () => {
         location.href = app.loginUrl();
       },
     }),
     ui({
+      id: "account.connectGitHub",
+      title: "Connect GitHub",
+      description: "Link your GitHub account to see private repositories and get live updates.",
+      category: "Account",
+      scope: "global",
+      when: () =>
+        !app.auth.authenticated
+          ? { enabled: false, reason: "Sign in first" }
+          : !app.auth.githubEnabled
+            ? { enabled: false, reason: "Connecting GitHub is not configured on this server" }
+            : app.auth.github?.connected
+              ? { enabled: false, reason: `Already connected as @${githubLogin(app.auth)}` }
+              : { enabled: true },
+      execute: () => {
+        location.href = app.githubConnectUrl();
+      },
+    }),
+    ui({
+      id: "account.disconnectGitHub",
+      title: "Disconnect GitHub",
+      description: "Unlink your GitHub account from Lanes; private repositories stop loading.",
+      category: "Account",
+      scope: "global",
+      when: () => (app.auth.github?.connected ? { enabled: true } : { enabled: false, reason: "GitHub is not connected" }),
+      execute: async () => {
+        await fetch("/auth/github/disconnect", { method: "POST", credentials: "include", headers: { "content-type": "application/json" } }).catch(() => {});
+        await app.checkSession();
+        void app.openRepo(app.view());
+      },
+    }),
+    ui({
       id: "account.signOut",
       title: "Sign Out",
-      description: "End the GitHub session.",
+      description: "End this session. Your GitHub connection stays for your next sign-in.",
       category: "Account",
       scope: "global",
       when: () => (app.auth.authenticated ? { enabled: true } : { enabled: false, reason: "Not signed in" }),

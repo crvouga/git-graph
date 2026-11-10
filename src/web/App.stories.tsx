@@ -5,7 +5,7 @@ import type { Meta, StoryObj } from "storybook-solidjs-vite";
 import { expect, userEvent, waitFor, within } from "storybook/test";
 import { AppShell } from "./App.tsx";
 import { app } from "./app/store.ts";
-import { commits, Frame, freezeEngine, openFixture, openHome } from "./storybook/harness.tsx";
+import { commits, Frame, freezeEngine, openFixture, openHome, setSession } from "./storybook/harness.tsx";
 
 const meta = {
   title: "App/Shell",
@@ -23,6 +23,28 @@ export const Home: Story = {
   beforeEach: () => openHome(),
   play: async ({ canvas }) => {
     await expect(canvas.getByRole("heading", { name: "Open a repository" })).toBeVisible();
+  },
+};
+
+/** On a Lanes server: sign in first (Google, through the auth relay). */
+export const HomeSignedOut: Story = {
+  beforeEach: async () => {
+    await openHome();
+    setSession("signed-out");
+  },
+  play: async ({ canvas }) => {
+    await expect(await canvas.findAllByRole("button", { name: /^Sign in$/ })).not.toHaveLength(0);
+  },
+};
+
+/** Signed in: connect GitHub next, for private repositories and live updates. */
+export const HomeSignedInConnectGitHub: Story = {
+  beforeEach: async () => {
+    await openHome();
+    setSession("signed-in");
+  },
+  play: async ({ canvas }) => {
+    await expect(await canvas.findAllByRole("button", { name: "Connect GitHub" })).toHaveLength(2); // control bar + home
   },
 };
 

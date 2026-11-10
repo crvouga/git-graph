@@ -16,7 +16,8 @@ try {
 const server = createServerApp(config);
 
 const warn = (msg: string) => console.log(JSON.stringify({ t: new Date().toISOString(), level: "warn", msg }));
-if (!config.githubClientId || !config.githubClientSecret) warn("GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET not set: sign-in disabled, public repositories only");
+if (!config.oidc || !config.databaseUrl) warn("OIDC_ISSUER / DATABASE_URL not set: sign-in disabled, public repositories only");
+else if (!config.githubClientId || !config.githubClientSecret) warn("GITHUB_CLIENT_ID / GITHUB_CLIENT_SECRET not set: connecting GitHub disabled");
 if (!config.webhookSecret) warn("GITHUB_WEBHOOK_SECRET not set: webhooks disabled, real-time sync relies on polling");
 if (!config.production && !process.env.SESSION_SECRET) warn("SESSION_SECRET not set: using an ephemeral secret (sessions do not survive restarts)");
 
