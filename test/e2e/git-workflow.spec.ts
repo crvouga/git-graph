@@ -77,10 +77,10 @@ test("worktree → stage one hunk → commit → diff → compare → push → s
   await expect(page.locator(".files [role=treeitem]:focus")).toHaveAttribute("data-file-path", "src/app.ts");
   await page.keyboard.press("Enter");
   const diff = page.getByTestId("diff-view");
-  await expect(diff.locator(".hunk")).toHaveCount(2);
+  await expect(diff.locator("[data-hunk]")).toHaveCount(2);
   await page.keyboard.press("s");
   await expect(diff).toContainText("Staged changes");
-  await expect(diff.locator(".hunk")).toHaveCount(2); // one staged + one unstaged
+  await expect(diff.locator("[data-hunk]")).toHaveCount(2); // one staged + one unstaged
   const cached = git(wtPath, ["diff", "--cached", "--", "src/app.ts"]);
   expect(cached).toContain("+export const line2 = 'first hunk change';");
   expect(cached).not.toContain("second hunk change");

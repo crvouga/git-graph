@@ -1,7 +1,7 @@
 // Diff of one file (commit, comparison or uncommitted), with hunk staging/unstaging/discarding,
 // and a conflict resolver for conflicted files. Escape returns focus to the file it came from.
 
-import { createEffect, createMemo, createResource, createSignal, For, onMount, Show } from "solid-js";
+import { createEffect, createMemo, createResource, createSignal, For, Index, Match, onCleanup, onMount, Show, Switch } from "solid-js";
 import { AppError, type CommitDetails, type ConflictFile, type Diff, type FileDiff, type Hunk } from "../../core/types.ts";
 import { WORKING } from "../../core/url/state.ts";
 import { app } from "../app/store.ts";
@@ -41,7 +41,7 @@ export function DiffView() {
   });
 
   const [sections] = createResource(
-    () => (conflicted() ? null : `${app.sessionId()}|${v().commit}|${v().compare}|${v().file}|${isWorking() ? JSON.stringify(app.repo.status) : ""}`),
+    () => (conflicted() || !app.readySession() ? null : `${app.readySession()}|${v().commit}|${v().compare}|${v().file}|${isWorking() ? JSON.stringify(app.repo.status) : ""}`),
     async (): Promise<Section[]> => {
       const p = path();
       if (isWorking()) {
@@ -63,7 +63,7 @@ export function DiffView() {
 
   // Sibling files for ]/[ navigation.
   const [siblings] = createResource(
-    () => `${app.sessionId()}|${v().commit}|${v().compare}|${isWorking() ? JSON.stringify(app.repo.status) : ""}`,
+    () => (app.readySession() ? `${app.readySession()}|${v().commit}|${v().compare}|${isWorking() ? JSON.stringify(app.repo.status) : ""}` : null),
     async (): Promise<string[]> => {
       if (isWorking()) {
         const s = app.repo.status;
@@ -82,6 +82,30 @@ export function DiffView() {
     return out;
   });
 
+  // Flattened, fixed-height items so diffs of any size render only the visible window.
+  const items = createMemo<DiffItem[]>(() => {
+    const out: DiffItem[] = [];
+    let gi = 0;
+    for (const sec of sections() ?? []) {
+      if (sec.title) out.push({ k: "title", text: sec.title });
+      const f = sec.file;
+      if (!f) {
+        out.push({ k: "note", text: "No changes in this file." });
+        continue;
+      }
+      if (f.oldPath && f.oldPath !== f.path) out.push({ k: "note", text: `renamed from ${f.oldPath}` });
+      if (f.binary) out.push({ k: "note", text: `Binary file ${f.status === "A" ? "added" : f.status === "D" ? "deleted" : "changed"}${f.oldSize !== undefined || f.newSize !== undefined ? ` (${f.oldSize ?? 0} → ${f.newSize ?? 0} bytes)` : ""}.` });
+      else if (f.hunks.length === 0) out.push({ k: "note", text: f.oldPath && f.oldPath !== f.path ? "Renamed without content changes." : "No content changes (mode or metadata only)." });
+      if (f.truncated) out.push({ k: "note", text: "This diff is large and was truncated." });
+      for (const h of f.hunks) {
+        out.push({ k: "hunk", gi: gi++, header: h.header, staged: sec.staged });
+        for (const l of h.lines) out.push({ k: "line", kind: l.kind, oldNo: l.oldNo, newNo: l.newNo, text: l.text });
+      }
+    }
+    return out;
+  });
+  let scroller: HTMLDivElement | undefined;
+
   onMount(() => root.focus({ preventScroll: true }));
   createEffect(() => {
     sections();
@@ -89,8 +113,11 @@ export function DiffView() {
   });
 
   const scrollHunk = (i: number) => {
-    const el = root.querySelector<HTMLElement>(`[data-hunk="${i}"]`);
-    el?.scrollIntoView({ block: "nearest" });
+    const idx = items().findIndex((x) => x.k === "hunk" && x.gi === i);
+    if (scroller && idx >= 0) {
+      const top = idx * DIFF_LINE_H;
+      if (top < scroller.scrollTop || top > scroller.scrollTop + scroller.clientHeight - 3 * DIFF_LINE_H) scroller.scrollTop = Math.max(0, top - DIFF_LINE_H);
+    }
   };
 
   const gotoFile = (dir: 1 | -1) => {
@@ -192,94 +219,25 @@ export function DiffView() {
           </button>
         </span>
       </div>
-      <div class="min-h-0 flex-1 overflow-auto">
-        <Show when={conflicted()}>
+      <Show when={conflicted()}>
+        <div class="min-h-0 flex-1 overflow-auto">
           <ConflictView path={path()} />
-        </Show>
-        <Show when={!conflicted()}>
-          <Show when={!sections.loading} fallback={<div class="p-4 text-muted">Loading diff…</div>}>
-            <Show when={!sections.error} fallback={<div class="text-del p-4">{AppError.from(sections.error).message}</div>}>
-              <For each={sections()}>
-                {(sec, si) => (
-                  <div>
-                    <Show when={sec.title}>
-                      <div class="sticky top-0 z-10 bg-[var(--panel)] px-3 py-1 text-xs font-bold uppercase">{sec.title}</div>
-                    </Show>
-                    <Show when={sec.file} fallback={<div class="p-4 text-muted">No changes in this file.</div>}>
-                      {(f) => (
-                        <>
-                          <Show when={f().oldPath && f().oldPath !== f().path}>
-                            <div class="diff-line meta">
-                              <span class="ln" />
-                              <span class="ln" />
-                              renamed from {f().oldPath}
-                            </div>
-                          </Show>
-                          <Show when={f().binary}>
-                            <div class="p-4">
-                              Binary file {f().status === "A" ? "added" : f().status === "D" ? "deleted" : "changed"}
-                              {f().oldSize !== undefined || f().newSize !== undefined ? ` (${f().oldSize ?? 0} → ${f().newSize ?? 0} bytes)` : ""}.
-                            </div>
-                          </Show>
-                          <Show when={!f().binary && f().hunks.length === 0}>
-                            <div class="p-4 text-muted">{f().oldPath && f().oldPath !== f().path ? "Renamed without content changes." : "No content changes (mode or metadata only)."}</div>
-                          </Show>
-                          <Show when={f().truncated}>
-                            <div class="p-2 text-warn">This diff is large and was truncated.</div>
-                          </Show>
-                          <For each={f().hunks}>
-                            {(h, hi) => {
-                              const gi = () => hunks().findIndex((x) => x.si === si() && x.hi === hi());
-                              return (
-                                <div class="hunk" classList={{ focused: focusHunk() === gi() }} data-hunk={gi()} role="group" aria-label={`Hunk ${h.header}`}>
-                                  <div class="hunk-head">
-                                    <span class="truncate">{h.header}</span>
-                                    <Show when={sec.staged !== null}>
-                                      <span class="ml-auto flex gap-2">
-                                        <button class="rounded border border-[var(--border)] px-1.5 text-[var(--fg)]" onClick={() => (setFocusHunk(gi()), hunkAction(gi(), "toggle"))}>
-                                          {sec.staged ? "Unstage hunk" : "Stage hunk"}
-                                        </button>
-                                        <Show when={!sec.staged}>
-                                          <button class="rounded border border-[var(--del)] px-1.5 text-del" onClick={() => (setFocusHunk(gi()), hunkAction(gi(), "discard"))}>
-                                            Discard
-                                          </button>
-                                        </Show>
-                                      </span>
-                                    </Show>
-                                  </div>
-                                  <For each={h.lines}>
-                                    {(l) => (
-                                      <div class={`diff-line ${l.kind === "add" ? "add" : l.kind === "del" ? "del" : l.kind === "meta" ? "meta" : ""}`}>
-                                        <span class="ln">{l.oldNo ?? ""}</span>
-                                        <span class="ln">{l.newNo ?? ""}</span>
-                                        <span>
-                                          {l.kind === "add" ? "+" : l.kind === "del" ? "-" : " "}
-                                          {l.text}
-                                        </span>
-                                      </div>
-                                    )}
-                                  </For>
-                                </div>
-                              );
-                            }}
-                          </For>
-                        </>
-                      )}
-                    </Show>
-                  </div>
-                )}
-              </For>
-            </Show>
+        </div>
+      </Show>
+      <Show when={!conflicted()}>
+        <Show when={sections.state === "ready" || sections.state === "errored"} fallback={<div class="p-4 text-muted">Loading diff…</div>}>
+          <Show when={!sections.error} fallback={<div class="text-del p-4">{AppError.from(sections.error).message}</div>}>
+            <VirtualDiff items={items()} focusHunk={focusHunk()} onHunk={(gi, kind) => (setFocusHunk(gi), hunkAction(gi, kind))} ref={(el) => (scroller = el)} />
           </Show>
         </Show>
-      </div>
+      </Show>
     </div>
   );
 }
 
 function ConflictView(p: { path: string }) {
   const [data, { refetch }] = createResource(
-    () => `${app.sessionId()}|${p.path}`,
+    () => (app.readySession() ? `${app.readySession()}|${p.path}` : null),
     () => portCall<ConflictFile>("conflict", [p.path]),
   );
   const [text, setText] = createSignal("");
@@ -345,6 +303,105 @@ function Pane(p: { title: string; text?: string }) {
       <pre class="mono m-0 min-h-0 flex-1 overflow-auto p-2 text-xs" tabIndex={0}>
         {p.text ?? "(absent)"}
       </pre>
+    </div>
+  );
+}
+
+
+const DIFF_LINE_H = 18;
+
+type DiffItem =
+  | { k: "title"; text: string }
+  | { k: "note"; text: string }
+  | { k: "hunk"; gi: number; header: string; staged: boolean | null }
+  | { k: "line"; kind: "context" | "add" | "del" | "meta"; oldNo?: number; newNo?: number; text: string };
+
+function VirtualDiff(p: { items: DiffItem[]; focusHunk: number; onHunk: (gi: number, kind: "toggle" | "discard") => void; ref: (el: HTMLDivElement) => void }) {
+  let el!: HTMLDivElement;
+  const [top, setTop] = createSignal(0);
+  const [height, setHeight] = createSignal(600);
+  onMount(() => {
+    p.ref(el);
+    const ro = new ResizeObserver(() => setHeight(el.clientHeight));
+    ro.observe(el);
+    setHeight(el.clientHeight);
+    onCleanup(() => ro.disconnect());
+  });
+  const width = createMemo(() => {
+    let max = 0;
+    for (const it of p.items) if (it.k === "line" && it.text.length > max) max = it.text.length;
+    return Math.max(600, 120 + max * 7.3);
+  });
+  const visible = createMemo(() => {
+    const a = Math.max(0, Math.floor(top() / DIFF_LINE_H) - 20);
+    const b = Math.min(p.items.length, Math.ceil((top() + height()) / DIFF_LINE_H) + 20);
+    const out: number[] = [];
+    for (let i = a; i < b; i++) out.push(i);
+    return out;
+  });
+  return (
+    <div ref={el} class="relative min-h-0 flex-1 overflow-auto" onScroll={() => setTop(el.scrollTop)} aria-label="Diff lines">
+      <div style={{ height: `${p.items.length * DIFF_LINE_H}px`, width: `${width()}px`, position: "relative" }}>
+        <Index each={visible()}>
+          {(i) => {
+            const it = () => p.items[i()]!;
+            const style = () => ({ position: "absolute" as const, top: `${i() * DIFF_LINE_H}px`, left: "0", right: "0", height: `${DIFF_LINE_H}px` });
+            return (
+              <Switch>
+                <Match when={it().k === "title"}>
+                  <div style={style()} class="bg-[var(--panel)] px-3 text-xs leading-[18px] font-bold uppercase">
+                    {(it() as { text: string }).text}
+                  </div>
+                </Match>
+                <Match when={it().k === "note"}>
+                  <div style={style()} class="diff-line meta">
+                    <span class="ln" />
+                    <span class="ln" />
+                    {(it() as { text: string }).text}
+                  </div>
+                </Match>
+                <Match when={it().k === "hunk"}>
+                  {(() => {
+                    const h = () => it() as { gi: number; header: string; staged: boolean | null };
+                    return (
+                      <div style={style()} class="hunk-head !py-0" classList={{ focused: p.focusHunk === h().gi }} data-hunk={h().gi} role="group" aria-label={`Hunk ${h().header}`}>
+                        <span class="truncate">{h().header}</span>
+                        <Show when={h().staged !== null}>
+                          <span class="ml-auto flex gap-2">
+                            <button class="rounded border border-[var(--border)] px-1.5 leading-[14px] text-[var(--fg)]" onClick={() => p.onHunk(h().gi, "toggle")}>
+                              {h().staged ? "Unstage hunk" : "Stage hunk"}
+                            </button>
+                            <Show when={!h().staged}>
+                              <button class="rounded border border-[var(--del)] px-1.5 leading-[14px] text-del" onClick={() => p.onHunk(h().gi, "discard")}>
+                                Discard
+                              </button>
+                            </Show>
+                          </span>
+                        </Show>
+                      </div>
+                    );
+                  })()}
+                </Match>
+                <Match when={it().k === "line"}>
+                  {(() => {
+                    const l = () => it() as { kind: string; oldNo?: number; newNo?: number; text: string };
+                    return (
+                      <div style={style()} class={`diff-line ${l().kind === "add" ? "add" : l().kind === "del" ? "del" : l().kind === "meta" ? "meta" : ""}`}>
+                        <span class="ln">{l().oldNo ?? ""}</span>
+                        <span class="ln">{l().newNo ?? ""}</span>
+                        <span>
+                          {l().kind === "add" ? "+" : l().kind === "del" ? "-" : " "}
+                          {l().text}
+                        </span>
+                      </div>
+                    );
+                  })()}
+                </Match>
+              </Switch>
+            );
+          }}
+        </Index>
+      </div>
     </div>
   );
 }

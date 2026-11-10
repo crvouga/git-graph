@@ -163,6 +163,7 @@ function createApp() {
   const focusMemory = { detailsFrom: null as string | null, diffFrom: null as string | null };
 
   let session = 0;
+  const [sessionSig, setSessionSig] = createSignal(0);
   let toastId = 0;
 
   // ------------------------------------------------------------------ derived
@@ -313,6 +314,7 @@ function createApp() {
       });
       if (mySession !== session) return;
       setRepo("loading", false);
+      setSessionSig(mySession);
       const target = v.at ?? v.commit;
       if (target) {
         if (res.row >= 0) {
@@ -362,11 +364,20 @@ function createApp() {
           if (ev.error.code === "UNAUTHENTICATED") void checkSession();
         } else toast("error", ev.error.message);
         break;
-      case "metric":
+      case "metric": {
         setMetrics(ev.name, Math.round(ev.value * 10) / 10);
+        const log = ((globalThis as { __lanesEvents?: unknown[] }).__lanesEvents ??= []);
+        log.push({ at: Date.now(), metric: ev.name, value: Math.round(ev.value) });
+        if (log.length > 100) log.shift();
         break;
-      case "event":
+      }
+      case "event": {
+        // Recent repository events, for diagnostics and automated tests.
+        const log = ((globalThis as { __lanesEvents?: unknown[] }).__lanesEvents ??= []);
+        log.push({ at: Date.now(), ...ev.event });
+        if (log.length > 100) log.shift();
         break;
+      }
     }
   });
 
@@ -822,6 +833,8 @@ function createApp() {
     navigate,
     openRepo,
     sessionId: () => session,
+    /** Reactive id of the session whose repository finished opening (0 = none yet). */
+    readySession: sessionSig,
     setScrollEl,
     getScrollEl: () => scrollEl,
     expandedRow,

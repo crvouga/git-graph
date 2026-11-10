@@ -140,7 +140,7 @@ export async function startHarness(): Promise<E2EState> {
           const payload = JSON.stringify(fake.pushPayload(repo, `refs/heads/${a.branch}`, before, sha, [sha]));
           const r = await fetch(`${appOrigin}/webhooks/github`, {
             method: "POST",
-            headers: { "content-type": "application/json", "x-github-event": "push", "x-github-delivery": `d-${Date.now()}-${Math.random()}`, "x-hub-signature-256": signWebhook(WEBHOOK_SECRET, payload) },
+            headers: { "content-type": "application/json", "x-github-event": "push", "x-github-delivery": crypto.randomUUID(), "x-hub-signature-256": signWebhook(WEBHOOK_SECRET, payload) },
             body: payload,
           });
           return ok({ sha, webhook: r.status });

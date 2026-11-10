@@ -152,7 +152,7 @@ export function Details() {
   );
 
   const [details] = createResource(
-    () => (!isWorking() && !v().compare && v().commit && app.repo.caps ? `${app.sessionId()}|${v().commit}` : null),
+    () => (!isWorking() && !v().compare && v().commit && app.readySession() ? `${app.readySession()}|${v().commit}` : null),
     async (key) => {
       const h = key.split("|")[1]!;
       const full = app.rows.commits[app.rows.index.get(h) ?? -1]?.hash ?? h;
@@ -160,7 +160,7 @@ export function Details() {
     },
   );
   const [comparison] = createResource(
-    () => (pair() && app.repo.caps ? `${app.sessionId()}|${pair()!.base}|${pair()!.head}` : null),
+    () => (pair() && app.readySession() ? `${app.readySession()}|${pair()!.base}|${pair()!.head}` : null),
     async (key) => {
       const [, base, head] = key.split("|");
       return portCall<Diff>("diff", [{ kind: "compare", base: base!, head: head! }]);

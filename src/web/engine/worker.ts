@@ -48,7 +48,7 @@ class Session {
   readonly id: number;
   readonly key: string;
   readonly source: SourceConfig;
-  readonly query: HistoryQuery;
+  query: HistoryQuery;
   readonly ctrl = new AbortController();
   port!: RepositoryPort;
   api: HttpApi | null = null;
@@ -242,7 +242,20 @@ class Session {
     }, 500);
   }
 
+  /** Drop branch-filter names that no longer exist (the UI explains it) instead of failing the query. */
+  private validateQuery(refs: RefsSnapshot) {
+    if (!this.query.refs.length) return;
+    const names = new Set<string>();
+    for (const r of refs.refs) {
+      names.add(r.short);
+      names.add(r.name);
+    }
+    const ok = this.query.refs.filter((n) => names.has(n) || /^[0-9a-f]{7,64}$/i.test(n));
+    if (ok.length !== this.query.refs.length) this.query = { ...this.query, refs: ok };
+  }
+
   private setRefs(refs: RefsSnapshot) {
+    this.validateQuery(refs);
     this.refs = refs;
     this.stashes = new Set(refs.refs.filter((r) => r.kind === "stash").map((r) => r.commit));
   }
@@ -364,6 +377,7 @@ class Session {
   private async reconcile(reason: string, force: boolean) {
     if (!this.alive) return;
     const t = performance.now();
+    this.emit({ t: "metric", name: `refresh.start.${reason}`, value: 0, session: this.id });
     this.setSync({ pending: this.sync.pending + 1 });
     try {
       const refs = await this.port.refs({ signal: this.ctrl.signal });
