@@ -49,6 +49,20 @@ Repository keys: `github:<owner>:<repo>`, `local:<id>` (from `local.open {path}`
 - UI elements have stable roles/labels (`grid` "Commit graph…", `row` with `data-hash`, `region` "Commit details",
   `tree` "Changed files", `combobox` in the palette). Prefer them in Playwright.
 
+## UI changes: always through Storybook
+
+Full guide: [docs/ui-development.md](docs/ui-development.md). Required for any change under `src/web/`
+that can alter what is rendered:
+
+1. Develop in Storybook (`pnpm storybook`, MCP at `http://localhost:6006/mcp`), not the running app.
+   Find the story for the UI you touch; if none shows that state, write it first.
+2. Add or update stories for every new or changed state, with `play` assertions for behaviour.
+   `pnpm test:storybook` must pass.
+3. Run `pnpm ui:compare` and look at every image in `.ui-shots/compare/`. Show the user the before/after
+   images (absolute paths) in your reply.
+4. After opening the PR, run `pnpm ui:publish --pr <number>` so the description has the before and
+   after screenshots. Re-run after later UI changes. A UI PR without them is not ready.
+
 ## Branches and pull requests
 
 - `main` is the only long-lived branch. Branch from `origin/main`, open a PR into `main`.

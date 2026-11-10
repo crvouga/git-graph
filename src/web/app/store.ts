@@ -8,6 +8,8 @@ import { EMPTY_VIEW, parseUrl, serialize, shouldPush, WORKING, type ViewState } 
 import { Engine, GraphRows } from "../engine/client.ts";
 import type { EngineEvent, SourceConfig, SyncInfo } from "../engine/protocol.ts";
 import { loadHandle } from "./handles.ts";
+import { address } from "./address.ts";
+import { IN_STORYBOOK } from "./env.ts";
 
 // ---------------------------------------------------------------------------
 // Persistence helpers (localStorage is only used for per-user preferences, never credentials
@@ -15,6 +17,7 @@ import { loadHandle } from "./handles.ts";
 // ---------------------------------------------------------------------------
 
 function load<T>(key: string, dflt: T): T {
+  if (IN_STORYBOOK) return dflt; // stories start from defaults, whatever this browser saved before
   try {
     const v = localStorage.getItem(key);
     return v ? (JSON.parse(v) as T) : dflt;
@@ -23,6 +26,7 @@ function load<T>(key: string, dflt: T): T {
   }
 }
 function save(key: string, v: unknown) {
+  if (IN_STORYBOOK) return;
   try {
     localStorage.setItem(key, JSON.stringify(v));
   } catch {
@@ -108,6 +112,8 @@ export interface FileFocus {
   path: string;
 }
 
+export const DEFAULT_COLUMNS: Columns = { graph: null, date: 124, author: 110, hash: 76, showDate: true, showAuthor: true, showHash: true };
+
 export const ROW_H = 24;
 export const DETAILS_H = 250;
 export const LANE_W = 16;
@@ -119,8 +125,8 @@ function createApp() {
   const engine = new Engine();
   const rows = new GraphRows();
   const [rowsVersion, setRowsVersion] = createSignal(0);
-  const [view, setViewSignal] = createSignal<ViewState>(parseUrl(location.href).state);
-  const [urlWarnings, setUrlWarnings] = createSignal<string[]>(parseUrl(location.href).warnings);
+  const [view, setViewSignal] = createSignal<ViewState>(parseUrl(address.href()).state);
+  const [urlWarnings, setUrlWarnings] = createSignal<string[]>(parseUrl(address.href()).warnings);
 
   const [repo, setRepo] = createStore<{
     info: RepoInfo | null;
@@ -142,7 +148,7 @@ function createApp() {
   });
 
   const [companion, setCompanionSignal] = createSignal<CompanionConfig>(load("lanes.companion", { baseUrl: "http://127.0.0.1:7420", token: null }));
-  const [columns, setColumnsSignal] = createSignal<Columns>(load("lanes.columns.v2", { graph: null, date: 124, author: 110, hash: 76, showDate: true, showAuthor: true, showHash: true }));
+  const [columns, setColumnsSignal] = createSignal<Columns>(load("lanes.columns.v2", DEFAULT_COLUMNS));
   const [recents, setRecents] = createSignal<RecentRepo[]>(load("lanes.recents", []));
   const [theme, setThemeSignal] = createSignal<"system" | "light" | "dark">(load("lanes.themePref", "system"));
 
@@ -228,9 +234,9 @@ function createApp() {
     const next = typeof patch === "function" ? patch(prev) : { ...prev, ...patch };
     const url = serialize(next);
     const push = !opts.replace && shouldPush(prev, next);
-    if (url !== location.pathname + location.search) {
-      if (push) history.pushState(null, "", url);
-      else history.replaceState(null, "", url);
+    if (url !== address.path()) {
+      if (push) address.push(url);
+      else address.replace(url);
     }
     applyView(next, prev);
   }
@@ -250,9 +256,9 @@ function createApp() {
     document.title = next.repo ? `${repoLabelOf(next.repo)} · Lanes` : "Lanes";
   }
 
-  window.addEventListener("popstate", () => {
+  address.onPop(() => {
     const prev = view();
-    const p = parseUrl(location.href);
+    const p = parseUrl(address.href());
     setUrlWarnings(p.warnings);
     applyView(p.state, prev);
   });
@@ -681,7 +687,7 @@ function createApp() {
     }
   }
   function loginUrl() {
-    return `/auth/login?returnTo=${encodeURIComponent(location.pathname + location.search)}`;
+    return `/auth/login?returnTo=${encodeURIComponent(address.path())}`;
   }
 
   function setCompanion(c: CompanionConfig) {
@@ -691,12 +697,12 @@ function createApp() {
 
   /** One-time pairing: `git-graph open` puts a single-use code in the URL fragment (never sent to servers). */
   async function pairFromFragment() {
-    const m = /(?:^|[#&])pair=([A-Za-z0-9_-]{6,128})/.exec(location.hash);
+    const m = /(?:^|[#&])pair=([A-Za-z0-9_-]{6,128})/.exec(address.hash());
     if (!m) return;
     const code = m[1]!;
-    const port = /(?:^|[#&])companion=(\d{2,5})/.exec(location.hash)?.[1];
+    const port = /(?:^|[#&])companion=(\d{2,5})/.exec(address.hash())?.[1];
     // Strip the code from the address bar and history immediately.
-    history.replaceState(null, "", location.pathname + location.search);
+    address.replace(address.path());
     const base = port ? `http://127.0.0.1:${port}` : companion().baseUrl;
     await pairCompanion(code, base);
   }
