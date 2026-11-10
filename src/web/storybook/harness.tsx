@@ -70,6 +70,25 @@ export function resetUi(): void {
   app.setColumns(DEFAULT_COLUMNS);
   app.setRefCursor(-1);
   app.setBusy(null);
+  app.setAuth(SIGNED_OUT_NO_SERVER);
+}
+
+const SIGNED_OUT_NO_SERVER = { checked: true, serverAvailable: false, authenticated: false, user: null, github: null, loginEnabled: false, githubEnabled: false };
+
+/** A deterministic avatar (no network in screenshots). */
+export const AVATAR = `data:image/svg+xml,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 18 18"><rect width="18" height="18" fill="#6e7781"/><circle cx="9" cy="7" r="3.2" fill="#fff"/><path d="M3 16c1-3.5 3.5-5 6-5s5 1.5 6 5" fill="#fff"/></svg>')}`;
+
+/** Pin the session shown by the UI: signed out (server reachable), signed in, GitHub connected. */
+export function setSession(state: "signed-out" | "signed-in" | "github-connected"): void {
+  app.setAuth({
+    checked: true,
+    serverAvailable: true,
+    loginEnabled: true,
+    githubEnabled: true,
+    authenticated: state !== "signed-out",
+    user: state === "signed-out" ? null : { name: "Alice Example", email: "alice@example.com", avatarUrl: null },
+    github: state === "signed-out" ? null : state === "github-connected" ? { connected: true, login: "alice", name: "Alice A.", avatarUrl: AVATAR } : { connected: false },
+  });
 }
 
 /** A view patch; `display` may be partial (merged over the defaults). */

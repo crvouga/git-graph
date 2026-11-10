@@ -1,7 +1,8 @@
 # Creating the GitHub App for Lanes
 
-Lanes signs users in with a **GitHub App** using user-to-server tokens. Requests are made with the
-user's own token, so a user only ever sees repositories they can access on GitHub *and* where the
+People sign in to Lanes through the shared auth relay (Google), then **connect GitHub** through a
+**GitHub App** using user-to-server tokens (stored encrypted in PostgreSQL). Requests are made with
+the user's own token, so a user only ever sees repositories they can access on GitHub *and* where the
 App is installed. An OAuth App also works (see the end), with fewer guarantees.
 
 Replace `<APP_ORIGIN>` below with your public origin, e.g. `https://git-graph.example.com`.
@@ -15,7 +16,7 @@ GitHub → **Settings → Developer settings → GitHub Apps → New GitHub App*
 | --- | --- |
 | GitHub App name | e.g. `Lanes (example.com)` — becomes the slug for `GITHUB_APP_SLUG` |
 | Homepage URL | `<APP_ORIGIN>` |
-| Callback URL | `<APP_ORIGIN>/auth/callback` (add `http://localhost:8787/auth/callback` as a second callback for local development) |
+| Callback URL | `<APP_ORIGIN>/auth/github/callback` (add `http://localhost:8787/auth/github/callback` as a second callback for local development) |
 | Expire user authorization tokens | **ON** (8-hour tokens with refresh tokens; the server refreshes them) |
 | Request user authorization (OAuth) during installation | ON (optional, smoother first run) |
 | Enable Device Flow | OFF |
@@ -82,7 +83,7 @@ Set the variables (see [deploy.md](deploy.md)) and restart the server. Then:
 ## OAuth App fallback
 
 If you cannot use a GitHub App: **Settings → Developer settings → OAuth Apps → New OAuth App**,
-Authorization callback URL `<APP_ORIGIN>/auth/callback`. Set `GITHUB_CLIENT_ID` /
+Authorization callback URL `<APP_ORIGIN>/auth/github/callback`. Set `GITHUB_CLIENT_ID` /
 `GITHUB_CLIENT_SECRET`. Differences:
 
 - Tokens do not expire (no refresh). Sign-out ends the server session; revoke the token at

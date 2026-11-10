@@ -3,7 +3,7 @@ import { expect, test } from "@playwright/test";
 import { control, state } from "./harness.ts";
 import { row, waitForGraph } from "./util.ts";
 
-test("private repository: denied anonymously, readable after sign-in, denied again after the session expires", async ({ page, context }) => {
+test("private repository: denied anonymously, readable after sign-in and connecting GitHub, denied again when GitHub revokes access", async ({ page, context }) => {
   const s = state();
   await page.goto(`${s.appOrigin}/github/octo/secret`);
   await expect(page.getByRole("alert")).toContainText("Repository not found");
@@ -11,20 +11,32 @@ test("private repository: denied anonymously, readable after sign-in, denied aga
   const api = await page.request.get(`${s.appOrigin}/api/v1/repositories/github:octo:secret/refs`);
   expect(api.status()).toBe(404);
 
-  // Sign in through the OAuth flow (fake GitHub authorizes "alice") and land back on the same URL.
-  await page.getByRole("link", { name: "Sign in with GitHub" }).click();
+  // Sign in through the auth relay (the fake relay signs in "alice") and land back on the same URL:
+  // still not found, because GitHub is not connected yet.
+  await page.getByRole("link", { name: "Sign in", exact: true }).click();
+  await expect(page).toHaveURL(`${s.appOrigin}/github/octo/secret`);
+  await expect(page.getByRole("alert")).toContainText("Connect your GitHub account");
+  let session = await (await page.request.get(`${s.appOrigin}/api/v1/session`)).json();
+  expect(session).toMatchObject({ authenticated: true, github: { connected: false } });
+
+  // Connect GitHub (fake GitHub authorizes "alice"): the private repository opens.
+  await page.getByRole("link", { name: "Connect GitHub" }).click();
   await expect(page).toHaveURL(`${s.appOrigin}/github/octo/secret`);
   await waitForGraph(page, 5);
+  await expect(page.getByRole("button", { name: /GitHub @alice/ })).toBeVisible();
   const cookies = await context.cookies();
-  expect(cookies.some((c) => /token/i.test(c.value) || c.value.startsWith("ghu_"))).toBe(false); // no token in the browser
-  const session = await (await page.request.get(`${s.appOrigin}/api/v1/session`)).json();
-  expect(session.authenticated).toBe(true);
-  expect(JSON.stringify(session)).not.toMatch(/ghu_|access_token|refresh_token/);
+  expect(cookies.some((c) => /token|alice/i.test(c.value) || c.value.startsWith("ghu_"))).toBe(false); // no token in the browser
+  session = await (await page.request.get(`${s.appOrigin}/api/v1/session`)).json();
+  expect(session).toMatchObject({ authenticated: true, github: { connected: true, login: "alice" } });
+  expect(JSON.stringify(session)).not.toMatch(/ghu_|ghr_|access_token|refresh_token/);
 
-  // GitHub revokes everything: the next authoritative read fails and the UI says so.
+  // GitHub revokes everything: the next authoritative read fails, GitHub is disconnected, and the UI
+  // offers to connect again (the Lanes session itself stays).
   await control("/expire", { login: "alice" });
   await page.reload();
   await expect(page.getByRole("alert")).toContainText(/not found|Connection needed|Access denied/i);
+  await page.reload();
+  await expect(page.getByRole("link", { name: "Connect GitHub" })).toBeVisible();
 });
 
 test("deep links reconstruct the view in a fresh browser session", async ({ browser }) => {

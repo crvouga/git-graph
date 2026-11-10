@@ -1,5 +1,6 @@
 // End-to-end harness: runs the PRODUCTION artifacts (dist/server/server.mjs serving dist/web,
-// dist/cli/git-graph.mjs serve) against disposable fixtures and a fake GitHub. Exposes a small
+// dist/cli/git-graph.mjs serve) against disposable fixtures, a fake GitHub, a fake auth relay and a
+// disposable PostgreSQL (PGlite over the wire protocol). Exposes a small
 // control API so tests can simulate external GitHub pushes (with signed webhooks), expire sessions,
 // and count upstream requests.
 
@@ -9,7 +10,9 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createServer } from "node:http";
 import { makeBasic, makeConflict } from "../fixtures/make-fixtures.ts";
+import { startTestDb } from "../fakes/db.ts";
 import { FakeGitHub, makeGitHubFixture, signWebhook } from "../fakes/github.ts";
+import { FakeRelay } from "../fakes/relay.ts";
 
 export const ROOT = resolve(import.meta.dirname, "../..");
 export const STATE_FILE = join(ROOT, "test-results", "e2e-state.json");
@@ -94,6 +97,12 @@ export async function startHarness(): Promise<E2EState> {
   const port = await freePort();
   const companionPort = await freePort();
   const appOrigin = `http://127.0.0.1:${port}`;
+  // Sign-in: a fake relay that signs everyone in as "alice", and a fresh database schema.
+  const relay = await new FakeRelay().start();
+  relay.redirectUris.add(`${appOrigin}/auth/callback`);
+  relay.authorizingSubject = "alice";
+  const db = await startTestDb();
+  await db.allocateSchema("lanes");
   start(
     process.execPath,
     [join(ROOT, "dist/server/server.mjs")],
@@ -108,6 +117,11 @@ export async function startHarness(): Promise<E2EState> {
       GITHUB_API_URL: fake.url,
       GITHUB_WEB_URL: fake.url,
       GITHUB_WEBHOOK_SECRET: WEBHOOK_SECRET,
+      OIDC_ISSUER: relay.issuer,
+      OIDC_CLIENT_ID: relay.clientId,
+      DATABASE_URL: db.url,
+      DATABASE_POOL_MAX: "3",
+      TOKEN_ENCRYPTION_KEY: "e2e-token-key-e2e-token-key-e2e-token-key-0123",
       STATIC_DIR: join(ROOT, "dist/web"),
     },
     "server",
@@ -181,6 +195,8 @@ export async function startHarness(): Promise<E2EState> {
     for (const c of children) c.kill("SIGTERM");
     control.close();
     await fake.close();
+    await relay.close();
+    await db.close();
     rmSync(fixturesRoot, { recursive: true, force: true });
   };
   return state;

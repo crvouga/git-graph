@@ -1,6 +1,7 @@
 // Compact top controls (Git Graph layout): repo, branch filter, remote toggle; icons on the right.
 
 import { createMemo, Show } from "solid-js";
+import { accountAvatar, accountLabel, canConnectGitHub, githubLogin } from "../app/account.ts";
 import { app } from "../app/store.ts";
 import { invoke } from "../app/commands.ts";
 import { formatShortcut } from "../app/platform.ts";
@@ -91,18 +92,28 @@ export function ControlBar() {
             <IconPlug />
           </span>
         </Show>
-        <Show when={app.auth.serverAvailable}>
+        <Show when={app.auth.serverAvailable && (app.auth.loginEnabled || app.auth.authenticated)}>
           <Show
             when={app.auth.authenticated}
             fallback={
               <button class="ml-1 rounded border border-[var(--border)] px-2 py-0.5 text-xs whitespace-nowrap" onClick={() => invoke("account.signIn")}>
-                Sign in with GitHub
+                Sign in
               </button>
             }
           >
-            <button class="icon-btn ml-1" title={`Signed in as ${app.auth.user?.login}`} aria-label={`Account: ${app.auth.user?.login}. Open account commands`} onClick={() => app.setPaletteOpen({ mode: "commands", initial: "Account: " })}>
-              <Show when={app.auth.user?.avatarUrl} fallback={<IconUser />}>
-                <img src={app.auth.user!.avatarUrl} alt="" width="18" height="18" style={{ "border-radius": "50%" }} />
+            <Show when={canConnectGitHub(app.auth)}>
+              <button class="ml-1 rounded border border-[var(--border)] px-2 py-0.5 text-xs whitespace-nowrap" title="Link GitHub to see private repositories and get live updates" onClick={() => invoke("account.connectGitHub")}>
+                Connect GitHub
+              </button>
+            </Show>
+            <button
+              class="icon-btn ml-1"
+              title={`Signed in as ${accountLabel(app.auth)}${githubLogin(app.auth) ? ` · GitHub @${githubLogin(app.auth)}` : ""}`}
+              aria-label={`Account: ${accountLabel(app.auth)}${githubLogin(app.auth) ? `, GitHub @${githubLogin(app.auth)}` : ", GitHub not connected"}. Open account commands`}
+              onClick={() => app.setPaletteOpen({ mode: "commands", initial: "Account: " })}
+            >
+              <Show when={accountAvatar(app.auth)} fallback={<IconUser />}>
+                <img src={accountAvatar(app.auth)!} alt="" width="18" height="18" style={{ "border-radius": "50%" }} />
               </Show>
             </button>
           </Show>

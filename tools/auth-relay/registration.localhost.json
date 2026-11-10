@@ -1,0 +1,7 @@
+{
+  "name": "Lanes local",
+  "project": "lanes",
+  "environment": "localhost",
+  "instance": "dev-server-8787",
+  "callbacks": ["http://localhost:8787/auth/callback"]
+}

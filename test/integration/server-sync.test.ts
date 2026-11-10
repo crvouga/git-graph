@@ -237,7 +237,7 @@ describe("real-time sync over SSE", () => {
     }
   });
 
-  it("app authorization revoked: the user's streams get access.revoked and sessions end", async () => {
+  it("app authorization revoked: the user's streams get access.revoked and GitHub is disconnected", async () => {
     const alice = await s.login("alice");
     const a = s.sse(SECRET, alice);
     await a.next(isHello);
@@ -245,7 +245,10 @@ describe("real-time sync over SSE", () => {
     await anon.next(isHello);
     await s.webhook("github_app_authorization", { action: "revoked", sender: { login: "alice", id: users.alice } });
     await a.next((e) => e.event.type === "access.revoked");
-    expect((await (await fetch(`${s.url}/api/v1/session`, { headers: { cookie: alice.header() } })).json()).authenticated).toBe(false);
+    await sleep(50);
+    // still signed in to Lanes; the GitHub connection is gone, so private repositories are too
+    expect(await (await fetch(`${s.url}/api/v1/session`, { headers: { cookie: alice.header() } })).json()).toMatchObject({ authenticated: true, github: { connected: false } });
+    expect((await fetch(`${s.url}/api/v1/repositories/${SECRET}`, { headers: { cookie: alice.header() } })).status).toBe(404);
     await sleep(50);
     expect(anon.events.some((e) => e.event.type === "access.revoked")).toBe(false);
     a.close();

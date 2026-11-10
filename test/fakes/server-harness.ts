@@ -1,5 +1,5 @@
-// Test harness: fake GitHub + Lanes server (in-process or listening), cookie jar, OAuth login,
-// signed webhooks and an SSE client.
+// Test harness: fake GitHub + fake auth relay + test PostgreSQL + Lanes server (in-process or
+// listening), cookie jar, relay sign-in, GitHub connection, signed webhooks and an SSE client.
 
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -11,10 +11,22 @@ import { createServerApp, type ServerApp } from "../../src/server/app.ts";
 import { testConfig, type ServerConfig } from "../../src/server/config.ts";
 import { HttpApi, subscribeEvents, type EventSubscription } from "../../src/core/api/client.ts";
 import type { EventEnvelope } from "../../src/core/types.ts";
+import { testDb, type TestDb } from "./db.ts";
 import { FakeGitHub, makeGitHubFixture, signWebhook } from "./github.ts";
+import { FakeRelay } from "./relay.ts";
 
 export const ORIGIN = "http://localhost:8787";
 export const WEBHOOK_SECRET = "test-webhook-secret";
+export const TOKEN_KEY = "test-token-encryption-key-test-token-encryption-key";
+
+let sharedRelay: Promise<FakeRelay> | null = null;
+/** The process-wide fake relay; it accepts the test origin's callback. */
+export function testRelay(): Promise<FakeRelay> {
+  return (sharedRelay ??= new FakeRelay().start().then((r) => {
+    r.redirectUris.add(`${ORIGIN}/auth/callback`);
+    return r;
+  }));
+}
 
 export class CookieJar {
   readonly cookies = new Map<string, string>();
@@ -54,7 +66,14 @@ export interface Stack {
   staticDir: string;
   users: { alice: number; bob: number; bot: number };
   req(path: string, init?: RequestInit & { jar?: CookieJar }): Promise<Response>;
+  relay: FakeRelay;
+  db: TestDb;
+  /** Sign in through the relay, then connect GitHub as the same person (most tests want both). */
   login(login: string, jar?: CookieJar, returnTo?: string): Promise<CookieJar>;
+  /** Sign in through the relay only. */
+  signIn(subject: string, jar?: CookieJar, returnTo?: string): Promise<CookieJar>;
+  /** Connect GitHub (as GitHub user `login`) for the signed-in jar. */
+  connectGitHub(login: string, jar: CookieJar, returnTo?: string): Promise<Response>;
   webhook(event: string, payload: unknown, opts?: { delivery?: string; secret?: string; signature?: string }): Promise<Response>;
   sse(key: string, jar?: CookieJar, cursor?: string | null): SseClient;
   close(): Promise<void>;
@@ -91,8 +110,16 @@ export async function startStack(opts: StackOptions = {}): Promise<Stack> {
   if (!fake) ({ fake, users } = await startFake(opts.fakeOptions));
   else users = { alice: fake.users.get("alice")!.id, bob: fake.users.get("bob")!.id, bot: fake.users.get("lanes-bot")!.id };
   const f = fake;
+  const relay = await testRelay();
+  const db = await testDb();
+  const schema = opts.config?.databaseSchema ?? (await db.allocateSchema());
   const staticDir = makeStaticDir();
   const config = testConfig({
+    oidc: { issuer: relay.issuer, clientId: relay.clientId, redirectUri: `${ORIGIN}/auth/callback`, scopes: "openid email profile", idpHint: "google" },
+    databaseUrl: db.url,
+    databaseSchema: schema,
+    databasePoolMax: 3,
+    tokenEncryptionKey: TOKEN_KEY,
     appOrigin: ORIGIN,
     githubClientId: f.opts.clientId,
     githubClientSecret: f.opts.clientSecret,
@@ -106,6 +133,7 @@ export async function startStack(opts: StackOptions = {}): Promise<Stack> {
     ...opts.config,
   });
   const server = createServerApp(config);
+  if (config.databaseUrl && config.migrateOnBoot) await server.ready();
   let url = ORIGIN;
   let http: ReturnType<typeof serve> | null = null;
   if (opts.listen) {
@@ -126,14 +154,31 @@ export async function startStack(opts: StackOptions = {}): Promise<Stack> {
     return res;
   };
 
-  const login = async (who: string, jar = new CookieJar(), returnTo = "/github/octo/basic") => {
-    f.authorizingUser = who;
+  const signIn = async (who: string, jar = new CookieJar(), returnTo = "/github/octo/basic") => {
+    relay.authorizingSubject = who;
     const r1 = await req(`/auth/login?returnTo=${encodeURIComponent(returnTo)}`, { jar });
     if (r1.status !== 302) throw new Error(`login: ${r1.status} ${await r1.text()}`);
     const r2 = await fetch(r1.headers.get("location")!, { redirect: "manual" });
+    if (r2.status !== 302) throw new Error(`relay authorize: ${r2.status} ${await r2.text()}`);
     const cb = new URL(r2.headers.get("location")!);
     const r3 = await req(cb.pathname + cb.search, { jar });
     if (r3.status !== 302) throw new Error(`callback: ${r3.status} ${await r3.text()}`);
+    return jar;
+  };
+
+  const connectGitHub = async (who: string, jar: CookieJar, returnTo = "/github/octo/basic") => {
+    f.authorizingUser = who;
+    const r1 = await req(`/auth/github/connect?returnTo=${encodeURIComponent(returnTo)}`, { jar });
+    if (r1.status !== 302) throw new Error(`connect: ${r1.status} ${await r1.text()}`);
+    const r2 = await fetch(r1.headers.get("location")!, { redirect: "manual" });
+    const cb = new URL(r2.headers.get("location")!);
+    return req(cb.pathname + cb.search, { jar });
+  };
+
+  const login = async (who: string, jar = new CookieJar(), returnTo = "/github/octo/basic") => {
+    await signIn(who, jar, returnTo);
+    const r = await connectGitHub(who, jar, returnTo);
+    if (r.status !== 302) throw new Error(`GitHub callback: ${r.status} ${await r.text()}`);
     return jar;
   };
 
@@ -204,7 +249,11 @@ export async function startStack(opts: StackOptions = {}): Promise<Stack> {
     staticDir,
     users,
     req,
+    relay,
+    db,
     login,
+    signIn,
+    connectGitHub,
     webhook,
     sse,
     async close() {

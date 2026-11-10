@@ -13,6 +13,9 @@ import type { EventEnvelope } from "../../core/types.ts";
 
 export interface Principal {
   sessionKey: string | null;
+  /** Signed-in Lanes account, if any. */
+  accountId: string | null;
+  /** GitHub user id of the account's connected GitHub, if any. */
   userId: number | null;
   /** Returns a token able to read repositories for this principal (null = anonymous). */
   token: () => Promise<string | null>;

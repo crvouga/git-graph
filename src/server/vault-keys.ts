@@ -49,6 +49,20 @@ export const VAULT_KEYS: readonly VaultKey[] = [
     purpose: "Lanes GitHub App → webhook secret (`openssl rand -hex 32`).",
   },
   {
+    env: "TOKEN_ENCRYPTION_KEY",
+    vault: "LANES_TOKEN_ENCRYPTION_KEY",
+    required: true,
+    check: (v) => (Buffer.byteLength(v) >= 32 ? null : "must be at least 32 bytes (openssl rand -base64 48)"),
+    purpose: "Encrypts linked GitHub tokens in PostgreSQL. Generate with `openssl rand -base64 48`; keep it stable (rotating disconnects every GitHub link).",
+  },
+  {
+    env: "DATABASE_URL",
+    vault: "DATABASE_URL",
+    required: true,
+    check: (v) => (/^postgres(ql)?:\/\//.test(v) ? null : "is not a postgres:// URL"),
+    purpose: "Shared PostgreSQL connection URL (already in Vault); Lanes uses only its allocated schema.",
+  },
+  {
     env: "GITHUB_PUBLIC_TOKEN",
     vault: "LANES_GITHUB_PUBLIC_TOKEN",
     required: false,

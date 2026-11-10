@@ -1,0 +1,7 @@
+{
+  "name": "Lanes",
+  "project": "lanes",
+  "environment": "production",
+  "instance": "lanes-chrisvouga-dev",
+  "callbacks": ["https://lanes.chrisvouga.dev/auth/callback"]
+}

@@ -8,6 +8,10 @@ const prod = {
   GITHUB_CLIENT_ID: "Iv23liExample",
   GITHUB_CLIENT_SECRET: "c".repeat(40),
   GITHUB_WEBHOOK_SECRET: "w".repeat(64),
+  OIDC_ISSUER: "https://auth.chrisvouga.dev/realms/projects",
+  OIDC_CLIENT_ID: "app-00000000-0000-4000-8000-000000000000",
+  DATABASE_URL: "postgres://user@db.example/app",
+  TOKEN_ENCRYPTION_KEY: "k".repeat(48),
 };
 
 describe("loadConfig", () => {
@@ -15,6 +19,10 @@ describe("loadConfig", () => {
     const c = loadConfig({
       NODE_ENV: "production",
       APP_ORIGIN: prod.APP_ORIGIN,
+      OIDC_ISSUER: prod.OIDC_ISSUER,
+      OIDC_CLIENT_ID: prod.OIDC_CLIENT_ID,
+      DATABASE_URL: prod.DATABASE_URL,
+      LANES_TOKEN_ENCRYPTION_KEY: prod.TOKEN_ENCRYPTION_KEY,
       LANES_SESSION_SECRET: prod.SESSION_SECRET,
       LANES_GITHUB_CLIENT_ID: prod.GITHUB_CLIENT_ID,
       LANES_GITHUB_CLIENT_SECRET: prod.GITHUB_CLIENT_SECRET,
@@ -23,6 +31,14 @@ describe("loadConfig", () => {
     expect(c.sessionSecret).toBe(prod.SESSION_SECRET);
     expect(c.githubClientId).toBe(prod.GITHUB_CLIENT_ID);
     expect(c.webhookSecret).toBe(prod.GITHUB_WEBHOOK_SECRET);
+    expect(c.tokenEncryptionKey).toBe(prod.TOKEN_ENCRYPTION_KEY);
+    expect(c.oidc).toEqual({ issuer: prod.OIDC_ISSUER, clientId: prod.OIDC_CLIENT_ID, redirectUri: `${prod.APP_ORIGIN}/auth/callback`, scopes: "openid email profile", idpHint: "google" });
+  });
+
+  it("sign-in settings come as a group", () => {
+    const { DATABASE_URL: _, ...noDb } = prod;
+    expect(() => loadConfig({ ...noDb, ALLOW_ANONYMOUS_ONLY: "1" })).toThrow("DATABASE_URL");
+    expect(() => loadConfig({ ...prod, TOKEN_ENCRYPTION_KEY: "short" })).toThrow("TOKEN_ENCRYPTION_KEY");
   });
 
   it("the plain runtime name wins over the Vault name", () => {
@@ -30,7 +46,7 @@ describe("loadConfig", () => {
   });
 
   it("fails fast in production when a release secret is missing, naming it", () => {
-    for (const k of ["APP_ORIGIN", "SESSION_SECRET", "GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET", "GITHUB_WEBHOOK_SECRET"] as const) {
+    for (const k of ["APP_ORIGIN", "SESSION_SECRET", "GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET", "GITHUB_WEBHOOK_SECRET", "OIDC_ISSUER", "OIDC_CLIENT_ID", "DATABASE_URL", "TOKEN_ENCRYPTION_KEY"] as const) {
       const env: Record<string, string> = { ...prod };
       delete env[k];
       expect(() => loadConfig(env), k).toThrow(k);

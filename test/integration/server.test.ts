@@ -80,182 +80,287 @@ describe("security headers and static hosting", () => {
   });
 });
 
-describe("GitHub sign-in", () => {
-  it("login → callback → session, without exposing tokens", async () => {
+const session = async (jar?: CookieJar, stack: Stack = s) => (await stack.req("/api/v1/session", { jar })).json();
+
+/** Start a relay sign-in and return the callback path the relay sends the browser to. */
+async function relayCallback(jar: CookieJar, who = "alice", returnTo = "/") {
+  s.relay.authorizingSubject = who;
+  const r1 = await s.req(`/auth/login?returnTo=${encodeURIComponent(returnTo)}`, { jar });
+  expect(r1.status).toBe(302);
+  const r2 = await fetch(r1.headers.get("location")!, { redirect: "manual" });
+  const cb = new URL(r2.headers.get("location")!);
+  return { authorize: new URL(r1.headers.get("location")!), callback: cb.pathname + cb.search };
+}
+
+describe("sign-in through the auth relay", () => {
+  it("login → callback → session; the cookie holds no identity or token", async () => {
     const jar = new CookieJar();
-    await s.login("alice", jar, "/github/octo/basic?commit=abc");
+    await s.signIn("alice", jar, "/github/octo/basic?commit=abc");
     const preLogin = jar.raw[0]!.split(";")[0];
     const final = jar.raw[jar.raw.length - 1]!.split(";")[0];
     expect(final).not.toBe(preLogin); // session id rotated on login
     expect(jar.raw[0]).toMatch(/HttpOnly/);
+    expect(jar.raw[0]).toMatch(/SameSite=Lax/);
+    expect(jar.header()).not.toMatch(/alice/i);
     const r = await s.req("/api/v1/session", { jar });
-    const text = await r.text();
-    const body = JSON.parse(text);
-    expect(body).toMatchObject({ authenticated: true, user: { login: "alice", name: "Alice A.", avatarUrl: expect.stringContaining("avatars") } });
-    expect(body.expiresAt).toBeGreaterThan(Date.now());
-    for (const t of fake.tokens.keys()) expect(text).not.toContain(t);
-    for (const t of fake.refreshTokens.keys()) expect(text).not.toContain(t);
     expect(r.headers.get("cache-control")).toBe("no-store");
+    const body = await r.json();
+    expect(body).toMatchObject({ authenticated: true, user: { name: "Alice", email: "alice@example.com" }, github: { connected: false }, githubConnectUrl: "/auth/github/connect" });
+    expect(body.expiresAt).toBeGreaterThan(Date.now());
+    const rows = await s.db.query<{ oidc_issuer: string; oidc_subject: string }>(`select oidc_issuer, oidc_subject from "${s.config.databaseSchema}".accounts where oidc_subject = 'alice'`);
+    expect(rows).toEqual([{ oidc_issuer: s.relay.issuer, oidc_subject: "alice" }]);
   });
 
-  it("redirects to the returnTo path after login", async () => {
-    fake.authorizingUser = "alice";
+  it("sends a public-client PKCE request with state and nonce, and returns to the page it started from", async () => {
     const jar = new CookieJar();
-    const r1 = await s.req("/auth/login?returnTo=%2Fgithub%2Focto%2Fbasic%3Fcommit%3Dabc", { jar });
-    const auth = new URL(r1.headers.get("location")!);
-    expect(auth.searchParams.get("code_challenge_method")).toBe("S256");
-    expect(auth.searchParams.get("code_challenge")).toMatch(/^[A-Za-z0-9_-]{43}$/);
-    expect(auth.searchParams.get("redirect_uri")).toBe(`${ORIGIN}/auth/callback`);
-    expect(auth.searchParams.get("scope")).toBe("read:user");
-    const r2 = await fetch(auth, { redirect: "manual" });
-    const cb = new URL(r2.headers.get("location")!);
-    const r3 = await s.req(cb.pathname + cb.search, { jar });
-    expect(r3.status).toBe(302);
-    expect(r3.headers.get("location")).toBe("/github/octo/basic?commit=abc");
+    const { authorize, callback } = await relayCallback(jar, "alice", "/github/octo/basic?commit=abc");
+    const q = authorize.searchParams;
+    expect(authorize.origin + authorize.pathname).toBe(`${s.relay.issuer}/protocol/openid-connect/auth`);
+    expect(q.get("client_id")).toBe(s.relay.clientId);
+    expect(q.get("redirect_uri")).toBe(`${ORIGIN}/auth/callback`);
+    expect(q.get("scope")).toBe("openid email profile");
+    expect(q.get("code_challenge_method")).toBe("S256");
+    expect(q.get("code_challenge")).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(q.get("state")).toBeTruthy();
+    expect(q.get("nonce")).toBeTruthy();
+    expect(q.get("kc_idp_hint")).toBe("google");
+    expect(q.has("client_secret")).toBe(false);
+    const r = await s.req(callback, { jar });
+    expect(r.status).toBe(302);
+    expect(r.headers.get("location")).toBe("/github/octo/basic?commit=abc");
+  });
+
+  for (const tamper of ["nonce", "audience", "issuer", "signature", "expired"] as const) {
+    it(`rejects an ID token with a bad ${tamper}`, async () => {
+      const jar = new CookieJar();
+      const { callback } = await relayCallback(jar);
+      s.relay.tamper = tamper;
+      try {
+        const r = await s.req(callback, { jar });
+        expect(r.status).toBe(400);
+        expect((await session(jar)).authenticated).toBe(false);
+      } finally {
+        s.relay.tamper = null;
+      }
+    });
+  }
+
+  it("rejects state replay, forged state and callbacks without the pre-login cookie", async () => {
+    const jar = new CookieJar();
+    const { callback } = await relayCallback(jar);
+    expect((await s.req(callback)).status).toBe(400); // another browser (no cookie)
+    const forged = new URL(callback, ORIGIN);
+    forged.searchParams.set("state", "forged");
+    expect((await s.req(forged.pathname + forged.search, { jar })).status).toBe(400);
+    // the forged attempt cleared the pending sign-in: the genuine callback now fails too
+    expect((await s.req(callback, { jar })).status).toBe(400);
+
+    const jar2 = new CookieJar();
+    const ok = await relayCallback(jar2);
+    const tokenRequests = s.relay.tokenRequests;
+    expect((await s.req(ok.callback, { jar: jar2 })).status).toBe(302);
+    expect((await s.req(ok.callback, { jar: jar2 })).status).toBe(400); // replay
+    expect(s.relay.tokenRequests).toBe(tokenRequests + 1); // the code was exchanged once
+  });
+
+  it("keeps concurrent sign-ins in separate tabs apart", async () => {
+    const jar = new CookieJar();
+    const a = await relayCallback(jar, "alice", "/tab-a");
+    const b = await relayCallback(jar, "alice", "/tab-b");
+    const rb = await s.req(b.callback, { jar });
+    expect(rb.headers.get("location")).toBe("/tab-b");
+    const ra = await s.req(a.callback, { jar });
+    expect(ra.status).toBe(302);
+    expect(ra.headers.get("location")).toBe("/tab-a");
+  });
+
+  it("identifies people by (issuer, subject), never by email", async () => {
+    s.relay.people.set("mallory", { email: "alice@example.com", name: "Mallory" });
+    try {
+      const alice = await s.signIn("alice");
+      const mallory = await s.signIn("mallory");
+      await s.connectGitHub("alice", alice);
+      expect((await session(alice)).github).toMatchObject({ connected: true, login: "alice" });
+      expect((await session(mallory)).github).toEqual({ connected: false }); // same email, different person
+      expect((await s.req(`/api/v1/repositories/${SECRET}`, { jar: mallory })).status).toBe(404);
+    } finally {
+      s.relay.people.delete("mallory");
+    }
+  });
+
+  it("rejects open redirects in returnTo", async () => {
+    for (const bad of ["//evil.example", "https://evil.example/x", "/\\evil.example", "javascript:alert(1)", "evil", `/${"x".repeat(1100)}`]) {
+      const r = await s.req(`/auth/login?returnTo=${encodeURIComponent(bad)}`);
+      expect(r.status, bad.slice(0, 30)).toBe(400);
+    }
+  });
+
+  it("logout requires same-origin, ends the session, and an old copy of the cookie stops working", async () => {
+    const jar = await s.login("alice");
+    const copy = new CookieJar();
+    for (const [k, v] of jar.cookies) copy.cookies.set(k, v);
+    expect((await s.req("/auth/logout", { method: "POST", jar })).status).toBe(403);
+    expect((await s.req("/auth/logout", { method: "POST", jar, headers: { origin: "https://evil.example" } })).status).toBe(403);
+    expect((await s.req("/auth/logout", { method: "POST", jar, headers: { origin: ORIGIN } })).status).toBe(200);
+    expect((await session(jar)).authenticated).toBe(false);
+    expect((await session(copy)).authenticated).toBe(false);
+  });
+
+  it("expires idle sessions", async () => {
+    const quick = await startStack({ fake, config: { sessionIdleTtlMs: 150 } });
+    try {
+      const jar = await quick.signIn("alice");
+      expect((await session(jar, quick)).authenticated).toBe(true);
+      await sleep(250);
+      expect((await session(jar, quick)).authenticated).toBe(false);
+    } finally {
+      await quick.close();
+    }
+  });
+
+  it("is off without the relay and database: anonymous only", async () => {
+    const anon = await startStack({ fake, config: { oidc: null, databaseUrl: null } });
+    try {
+      expect(await session(undefined, anon)).toMatchObject({ authenticated: false, loginUrl: null, githubConnectUrl: null });
+      expect((await anon.req("/auth/login")).status).toBe(501);
+      expect((await anon.req("/auth/github/connect")).status).toBe(501);
+      expect((await anon.req(`/api/v1/repositories/${KEY}/refs`)).status).toBe(200);
+    } finally {
+      await anon.close();
+    }
+  });
+});
+
+describe("connecting GitHub", () => {
+  it("needs a signed-in account first, then comes back to connect", async () => {
+    const r = await s.req("/auth/github/connect?returnTo=%2Fgithub%2Focto%2Fsecret");
+    expect(r.status).toBe(302);
+    const loc = new URL(r.headers.get("location")!, ORIGIN);
+    expect(loc.pathname).toBe("/auth/login");
+    expect(loc.searchParams.get("returnTo")).toBe("/auth/github/connect?returnTo=%2Fgithub%2Focto%2Fsecret");
+  });
+
+  it("gives access to private repositories; tokens are stored encrypted, never sent to the browser", async () => {
+    const jar = await s.signIn("alice");
+    await post("/auth/github/disconnect", {}, jar); // earlier tests connected alice; start clean
+    expect((await s.req(`/api/v1/repositories/${SECRET}`, { jar })).status).toBe(404);
+    const r = await s.connectGitHub("alice", jar, "/github/octo/secret");
+    expect(r.status).toBe(302);
+    expect(r.headers.get("location")).toBe("/github/octo/secret");
+    const info = await s.req("/api/v1/session", { jar });
+    const text = await info.text();
+    expect(JSON.parse(text).github).toMatchObject({ connected: true, login: "alice", name: "Alice A." });
+    for (const t of [...fake.tokens.keys(), ...fake.refreshTokens.keys()]) {
+      expect(text).not.toContain(t);
+      expect(jar.header()).not.toContain(t);
+    }
+    expect((await s.req(`/api/v1/repositories/${SECRET}`, { jar })).status).toBe(200);
+    const rows = await s.db.query<Record<string, string>>(`select access_token, refresh_token, github_login from "${s.config.databaseSchema}".github_links`);
+    expect(rows.some((row) => row.github_login === "alice")).toBe(true);
+    const dump = JSON.stringify(rows);
+    for (const t of [...fake.tokens.keys(), ...fake.refreshTokens.keys()]) expect(dump).not.toContain(t);
   });
 
   it("rejects a PKCE mismatch", async () => {
-    fake.authorizingUser = "alice";
-    const jar = new CookieJar();
-    const r1 = await s.req("/auth/login", { jar });
+    const jar = await s.signIn("bob");
+    fake.authorizingUser = "bob";
+    const r1 = await s.req("/auth/github/connect", { jar });
     const auth = new URL(r1.headers.get("location")!);
+    expect(auth.searchParams.get("redirect_uri")).toBe(`${ORIGIN}/auth/github/callback`);
     auth.searchParams.set("code_challenge", "A".repeat(43)); // attacker-substituted challenge
     const r2 = await fetch(auth, { redirect: "manual" });
     const cb = new URL(r2.headers.get("location")!);
     const r3 = await s.req(cb.pathname + cb.search, { jar });
     expect(r3.status).toBe(400);
     expect(await r3.text()).toContain("invalid_grant");
-    expect((await (await s.req("/api/v1/session", { jar })).json()).authenticated).toBe(false);
+    expect((await session(jar)).github).toEqual({ connected: false });
   });
 
-  it("rejects state replay, forged state and callbacks without the pre-login cookie", async () => {
-    fake.authorizingUser = "alice";
-    const jar = new CookieJar();
-    const r1 = await s.req("/auth/login", { jar });
-    const r2 = await fetch(r1.headers.get("location")!, { redirect: "manual" });
-    const cb = new URL(r2.headers.get("location")!);
-    // another browser (no cookie) cannot complete it
-    expect((await s.req(cb.pathname + cb.search)).status).toBe(400);
-    // the pre-login session can — once
-    const jar2 = new CookieJar();
-    const r1b = await s.req("/auth/login", { jar: jar2 });
-    const r2b = await fetch(r1b.headers.get("location")!, { redirect: "manual" });
-    const cbb = new URL(r2b.headers.get("location")!);
-    const forged = new URL(cbb);
-    forged.searchParams.set("state", "forged");
-    expect((await s.req(forged.pathname + forged.search, { jar: jar2 })).status).toBe(400);
-    // the forged attempt consumed the pending state: the genuine callback now fails too (single use)
-    expect((await s.req(cbb.pathname + cbb.search, { jar: jar2 })).status).toBe(400);
-
-    const jar3 = await s.login("alice");
-    void jar3;
-    const jar4 = new CookieJar();
-    const r1c = await s.req("/auth/login", { jar: jar4 });
-    const r2c = await fetch(r1c.headers.get("location")!, { redirect: "manual" });
-    const cbc = new URL(r2c.headers.get("location")!);
-    expect((await s.req(cbc.pathname + cbc.search, { jar: jar4 })).status).toBe(302);
-    expect((await s.req(cbc.pathname + cbc.search, { jar: jar4 })).status).toBe(400); // replay
+  it("one GitHub account connects to one Lanes account", async () => {
+    const first = await s.signIn("carol");
+    expect((await s.connectGitHub("bob", first)).status).toBe(302);
+    const second = await s.signIn("dave");
+    const r = await s.connectGitHub("bob", second);
+    expect(r.status).toBe(409);
+    expect(await r.text()).toContain("already connected to another Lanes account");
+    expect((await session(second)).github).toEqual({ connected: false });
+    expect((await session(first)).github).toMatchObject({ connected: true, login: "bob" });
+    await post("/auth/github/disconnect", {}, first);
   });
 
-  it("rejects open redirects in returnTo", async () => {
-    for (const bad of ["//evil.example", "https://evil.example/x", "/\\evil.example", "javascript:alert(1)", "evil", "/%0d%0aSet-Cookie:x"]) {
-      const r = await s.req(`/auth/login?returnTo=${encodeURIComponent(bad)}`);
-      if (bad === "/%0d%0aSet-Cookie:x") {
-        // percent-encoded CR/LF stays encoded inside the path: harmless same-origin path
-        expect([302, 400]).toContain(r.status);
-        if (r.status === 302) expect(r.headers.get("location")!.startsWith(fake.url)).toBe(true);
-        continue;
-      }
-      expect(r.status, bad).toBe(400);
-    }
-  });
-
-  it("logout requires same-origin and ends the session", async () => {
-    const jar = await s.login("alice");
-    expect((await s.req("/auth/logout", { method: "POST", jar })).status).toBe(403);
-    expect((await s.req("/auth/logout", { method: "POST", jar, headers: { origin: "https://evil.example" } })).status).toBe(403);
-    const r = await s.req("/auth/logout", { method: "POST", jar, headers: { origin: ORIGIN } });
-    expect(r.status).toBe(200);
-    expect((await (await s.req("/api/v1/session", { jar })).json()).authenticated).toBe(false);
-  });
-
-  it("refreshes expiring GitHub App tokens; a revoked refresh token ends the session", async () => {
-    const short = await startStack({ fake, config: {} });
+  it("refreshes expiring GitHub App tokens; a revoked refresh token disconnects GitHub, not the session", async () => {
     const prevTtl = fake.opts.accessTokenTtl;
     (fake.opts as { accessTokenTtl: number | null }).accessTokenTtl = 60; // within the refresh window
     try {
-      const jar = await short.login("alice");
+      const jar = await s.login("alice");
       const before = fake.countRequests((r) => r.path.startsWith("/login/oauth/access_token"));
-      const ok = await short.req(`/api/v1/repositories/${SECRET}`, { jar });
-      expect(ok.status).toBe(200);
+      expect((await s.req(`/api/v1/repositories/${SECRET}`, { jar })).status).toBe(200);
       expect(fake.countRequests((r) => r.path.startsWith("/login/oauth/access_token"))).toBeGreaterThan(before); // refreshed
       fake.revokeRefreshTokens("alice");
-      const denied = await short.req(`/api/v1/repositories/${SECRET}`, { jar });
+      const denied = await s.req(`/api/v1/repositories/${SECRET}`, { jar });
       expect(denied.status).toBe(401);
       expect((await denied.json()).error.code).toBe("UNAUTHENTICATED");
-      expect((await (await short.req("/api/v1/session", { jar })).json()).authenticated).toBe(false);
+      expect(await session(jar)).toMatchObject({ authenticated: true, github: { connected: false } });
     } finally {
       (fake.opts as { accessTokenTtl: number | null }).accessTokenTtl = prevTtl;
-      await short.close();
     }
   });
 
-  it("keeps sessions in a sealed cookie: they survive a restart without server state", async () => {
+  it("disconnects GitHub when GitHub rejects the token", async () => {
+    const jar = await s.login("alice");
+    for (const [t, info] of fake.tokens) if (info.login === "alice") fake.tokens.delete(t);
+    expect((await s.req(`/api/v1/repositories/${KEY}/refs`, { jar })).status).toBe(401);
+    await sleep(50);
+    expect(await session(jar)).toMatchObject({ authenticated: true, github: { connected: false } });
+  });
+
+  it("disconnect requires same-origin and removes access", async () => {
+    const jar = await s.login("alice");
+    expect((await s.req("/auth/github/disconnect", { method: "POST", jar })).status).toBe(403);
+    expect((await post("/auth/github/disconnect", {}, jar)).status).toBe(200);
+    expect((await session(jar)).github).toEqual({ connected: false });
+    expect((await s.req(`/api/v1/repositories/${SECRET}`, { jar })).status).toBe(404);
+  });
+
+  it("the connection persists in PostgreSQL: a new server process with the same database keeps it", async () => {
     const sessionSecret = "s".repeat(48);
     const a = await startStack({ fake, config: { sessionSecret } });
     const jar = await a.login("alice");
+    const schema = a.config.databaseSchema;
     await a.close();
-    const cookie = jar.header();
-    for (const t of fake.tokens.keys()) expect(cookie).not.toContain(t);
-    for (const t of fake.refreshTokens.keys()) expect(cookie).not.toContain(t);
-    expect(cookie).not.toContain("alice");
-    const b = await startStack({ fake, config: { sessionSecret } }); // a new process, nothing on disk
+    const b = await startStack({ fake, config: { sessionSecret, databaseSchema: schema } }); // nothing on local disk
     try {
-      expect((await (await b.req("/api/v1/session", { jar })).json()).user.login).toBe("alice");
+      expect(await session(jar, b)).toMatchObject({ authenticated: true, github: { connected: true, login: "alice" } });
+      expect((await b.req(`/api/v1/repositories/${SECRET}`, { jar })).status).toBe(200);
       // a tampered cookie is ignored and cleared
       const [name, value] = [...jar.cookies][0]!;
       const forged = new CookieJar();
       forged.cookies.set(name, value.slice(0, -4) + (value.endsWith("AAAA") ? "BBBB" : "AAAA"));
-      const r = await b.req("/api/v1/session", { jar: forged });
-      expect((await r.json()).authenticated).toBe(false);
+      expect((await session(forged, b)).authenticated).toBe(false);
       expect(forged.cookies.has(name)).toBe(false);
     } finally {
       await b.close();
     }
-    const c = await startStack({ fake, config: { sessionSecret: "x".repeat(48) } }); // rotated secret
+    const c = await startStack({ fake, config: { sessionSecret: "x".repeat(48), databaseSchema: schema } }); // rotated secret
     try {
-      expect((await (await c.req("/api/v1/session", { jar })).json()).authenticated).toBe(false);
+      expect((await session(jar, c)).authenticated).toBe(false);
     } finally {
       await c.close();
     }
   });
 
-  it("an old copy of the cookie stops working after logout", async () => {
-    const jar = await s.login("alice");
-    const copy = new CookieJar();
-    for (const [k, v] of jar.cookies) copy.cookies.set(k, v);
-    expect((await s.req("/auth/logout", { method: "POST", jar, headers: { origin: ORIGIN } })).status).toBe(200);
-    expect((await (await s.req("/api/v1/session", { jar: copy })).json()).authenticated).toBe(false);
-  });
-
-  it("expires idle sessions", async () => {
-    const quick = await startStack({ fake, config: { sessionIdleTtlMs: 150 } });
+  it("migrations are idempotent and refuse an unallocated schema", async () => {
+    const { connectDb } = await import("../../src/server/db.ts");
+    const { migrate } = await import("../../src/server/migrations.ts");
+    const db = connectDb(s.db.url, { schema: s.config.databaseSchema, max: 1 });
+    const missing = connectDb(s.db.url, { schema: "not_allocated", max: 1 });
     try {
-      const jar = await quick.login("alice");
-      expect((await (await quick.req("/api/v1/session", { jar })).json()).authenticated).toBe(true);
-      await sleep(250);
-      expect((await (await quick.req("/api/v1/session", { jar })).json()).authenticated).toBe(false);
+      expect(await migrate(db)).toEqual([]);
+      await expect(migrate(missing)).rejects.toThrow("must be allocated");
     } finally {
-      await quick.close();
+      await db.close();
+      await missing.close();
     }
-  });
-
-  it("ends the session when GitHub rejects the user's token", async () => {
-    const jar = await s.login("alice");
-    for (const [t, info] of fake.tokens) if (info.login === "alice") fake.tokens.delete(t);
-    const r = await s.req(`/api/v1/repositories/${KEY}/refs`, { jar });
-    expect(r.status).toBe(401);
-    expect((await (await s.req("/api/v1/session", { jar })).json()).authenticated).toBe(false);
   });
 });
 
