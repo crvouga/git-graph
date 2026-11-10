@@ -1,0 +1,51 @@
+# Fly.io example. Deploy from the repository root:
+#   fly launch --no-deploy --copy-config -c deploy/fly.toml   # first time (pick a unique app name)
+#   fly volumes create lanes_data --size 1 -c deploy/fly.toml
+#   fly secrets set SESSION_SECRET="$(openssl rand -base64 48)" GITHUB_CLIENT_ID=... GITHUB_CLIENT_SECRET=... GITHUB_WEBHOOK_SECRET=... -c deploy/fly.toml
+#   fly deploy -c deploy/fly.toml --dockerfile Dockerfile .
+#
+# Run exactly ONE machine: the event hub, poller and session cache live in process
+# (sessions and webhook dedupe persist to the /data volume).
+
+app = "lanes-git-graph"
+primary_region = "iad"
+
+[build]
+  dockerfile = "../Dockerfile"
+
+[env]
+  NODE_ENV = "production"
+  PORT = "8787"
+  APP_ORIGIN = "https://lanes-git-graph.fly.dev"
+  STATIC_DIR = "/app/dist/web"
+  DATA_DIR = "/data"
+  # Fly's edge proxy appends the client address to X-Forwarded-For.
+  TRUST_PROXY = "1"
+
+[http_service]
+  internal_port = 8787
+  force_https = true
+  # SSE streams and the reconciliation poller need a running process.
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.concurrency]
+    type = "connections"
+    soft_limit = 800
+    hard_limit = 1000
+
+  [[http_service.checks]]
+    method = "GET"
+    path = "/health"
+    interval = "15s"
+    timeout = "5s"
+    grace_period = "10s"
+
+[[mounts]]
+  source = "lanes_data"
+  destination = "/data"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"

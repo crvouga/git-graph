@@ -1,0 +1,12 @@
+node_modules
+dist
+.fixtures
+.data
+.cache
+.env
+.env.*
+!.env.example
+test-results
+playwright-report
+*.log
+.git

@@ -141,8 +141,8 @@ export async function resolveRepo(ctx: CommandContext, key: string | undefined):
 export async function availability(cmd: AnyCommand, ctx: CommandContext, args: Record<string, unknown> = {}): Promise<Availability> {
   try {
     if (cmd.capability) {
-      const repo = await resolveRepo(ctx, args.repo as string | undefined).catch(() => null);
-      if (!repo) return { enabled: false, reason: "Open a repository first" };
+      if (!args.repo && !ctx.repo) return { enabled: false, reason: "Open a repository first" };
+      const repo = await resolveRepo(ctx, args.repo as string | undefined);
       const caps = await repo.capabilities({ signal: ctx.signal });
       const c = caps[cmd.capability];
       if (!c.available) return { enabled: false, reason: c.reason };
@@ -150,7 +150,10 @@ export async function availability(cmd: AnyCommand, ctx: CommandContext, args: R
     if (cmd.when) return await cmd.when(ctx, args);
     return { enabled: true };
   } catch (e) {
-    return { enabled: false, reason: AppError.from(e).message };
+    const err = AppError.from(e);
+    // Access and existence problems are not "unsupported": let callers see 401/403/404/429.
+    if (err.code === "NOT_FOUND" || err.code === "UNAUTHENTICATED" || err.code === "FORBIDDEN" || err.code === "RATE_LIMITED") throw err;
+    return { enabled: false, reason: err.message };
   }
 }
 

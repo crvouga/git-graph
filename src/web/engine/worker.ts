@@ -30,16 +30,10 @@ function queryKey(repoKey: string, q: HistoryQuery): string {
   return `${repoKey}|${q.refs.join(",")}|${+q.includeRemotes}${+q.includeTags}${+q.includeStashes}${+q.firstParent}|${q.order}`;
 }
 
+/** Read-only repository over the File System Access API, parsed in this worker (lazy-loaded). */
 async function openFsRepository(handle: FileSystemDirectoryHandle, key: string): Promise<RepositoryPort> {
-  const mod = (await import("../../browser-git/repo.ts")) as Record<string, unknown>;
-  const id = key.split(":")[1]!;
-  const factory = (mod.openBrowserGitRepository ?? mod.createBrowserGitRepository ?? mod.openRepository) as
-    | ((h: FileSystemDirectoryHandle, id: string) => Promise<RepositoryPort> | RepositoryPort)
-    | undefined;
-  if (typeof factory === "function") return factory(handle, id);
-  const Ctor = mod.BrowserGitRepository as (new (...a: unknown[]) => RepositoryPort) & { open?: (...a: unknown[]) => Promise<RepositoryPort> };
-  if (Ctor?.open) return Ctor.open(handle, id);
-  throw new AppError("UNSUPPORTED", "Browser repository reader is unavailable in this build");
+  const [{ BrowserGitRepository }, { FsAccessSource }] = await Promise.all([import("../../browser-git/repo.ts"), import("../../browser-git/source.ts")]);
+  return BrowserGitRepository.open(new FsAccessSource(handle), key.split(":")[1]!);
 }
 
 let env = { visible: true, focused: true, online: true };
