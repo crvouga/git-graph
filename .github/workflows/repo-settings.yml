@@ -1,0 +1,48 @@
+name: Repository settings
+
+# Keeps GitHub in sync with .github/repo-settings.json.
+#  - PRs that touch it: show the planned changes.
+#  - Merged to main: apply.
+#  - Weekly: fail if someone changed settings in the UI.
+# Needs a REPO_ADMIN_TOKEN secret: a fine-grained token for this repository with
+# "Administration: read and write". Without it the job logs a notice and does nothing.
+on:
+  pull_request:
+    paths: [.github/repo-settings.json, scripts/github-settings.ts]
+  push:
+    branches: [main]
+    paths: [.github/repo-settings.json, scripts/github-settings.ts]
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: repo-settings
+  cancel-in-progress: false
+
+jobs:
+  settings:
+    name: Repository settings
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ secrets.REPO_ADMIN_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Plan, apply or check
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::notice::REPO_ADMIN_TOKEN is not set; run 'pnpm github:apply' locally instead."
+            exit 0
+          fi
+          case "${{ github.event_name }}" in
+            pull_request) node scripts/github-settings.ts --plan ;;
+            push|workflow_dispatch) node scripts/github-settings.ts ;;
+            *) node scripts/github-settings.ts --check ;;
+          esac

@@ -48,3 +48,15 @@ Repository keys: `github:<owner>:<repo>`, `local:<id>` (from `local.open {path}`
 - Commands live in `src/core/commands/` — add a command there, not in a single interface.
 - UI elements have stable roles/labels (`grid` "Commit graph…", `row` with `data-hash`, `region` "Commit details",
   `tree` "Changed files", `combobox` in the palette). Prefer them in Playwright.
+
+## Branches and pull requests
+
+- `main` is the only long-lived branch. Branch from `origin/main`, open a PR into `main`.
+- Merges are squash-only; the PR title becomes the commit title on `main`, so write it as one.
+  Head branches are deleted automatically after merge.
+- `main` takes no direct pushes or force pushes. A PR merges once the single required check, **CI ok**, passes.
+  Queue it right away: `gh pr merge --auto --squash`.
+- Every green CI run on `main` deploys (`.github/workflows/deploy.yml`, once `FLY_API_TOKEN` is set).
+- GitHub settings (merge methods, branch rules, security) live in `.github/repo-settings.json`.
+  Change them there, then `pnpm github:plan` / `pnpm github:apply`. Don't change them in the GitHub UI;
+  the weekly drift check fails if you do. To add a CI job to the gate, add it to `ci-ok.needs`.
