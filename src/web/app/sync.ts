@@ -8,7 +8,7 @@
 //  - The browser agent: folders opened with "Open Folder…" are read in this tab and published to
 //    the account through the same mutators a companion uses.
 
-import { createComputed, createSignal, on, type Accessor } from "solid-js";
+import { createComputed, createMemo, createSignal, on, type Accessor } from "solid-js";
 import { startZeroAgent } from "../../agent/zero-agent.ts";
 import { createRepoRegistry } from "../../core/commands/repo-commands.ts";
 import { AppError, type MutationResult } from "../../core/types.ts";
@@ -55,10 +55,12 @@ export function requestRead(s: ReadSpec): void {
 
 /** A read as Solid accessors. `spec` returning null means "nothing to read yet". */
 export function useRead<T>(spec: () => ReadSpec | null): ReadState<T> {
-  const id = () => {
+  // A memo, so a view change that leaves the read the same does not reset it (which would empty
+  // the panel for a moment and rebuild its elements, losing keyboard focus).
+  const id = createMemo(() => {
     const s = spec();
     return s ? idOf(s) : "";
-  };
+  });
   const row = live<ReadRow>(() => (id() ? queries.reads.byId({ id: id() }) : null));
   createComputed(
     on(id, (k) => {

@@ -5,7 +5,7 @@
 // The UI renders what it has; there is no loading state to show.
 
 import { Zero } from "@rocicorp/zero";
-import { createComputed, createSignal, on, onCleanup, type Accessor } from "solid-js";
+import { createComputed, createMemo, createSignal, on, onCleanup, type Accessor } from "solid-js";
 import { mutators } from "../../zero/mutators.ts";
 import { schema, type ZeroContext } from "../../zero/schema.ts";
 import { IN_STORYBOOK } from "./env.ts";
@@ -80,10 +80,11 @@ function keyOf(q: unknown): string {
 export function live<T>(query: () => unknown, opts: { ttl?: "none" | `${number}s` | `${number}m` } = {}): { data: Accessor<T | undefined>; type: Accessor<ResultType> } {
   const [data, setData] = createSignal<T | undefined>(undefined, { equals: false });
   const [type, setType] = createSignal<ResultType>("unknown");
-  const key = () => {
+  // A memo: re-materialize only when the query itself changes, not on every signal it reads.
+  const key = createMemo(() => {
     const q = query();
     return q ? keyOf(q) : "";
-  };
+  });
   createComputed(
     on(key, (k) => {
       setData(undefined);

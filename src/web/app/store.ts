@@ -211,6 +211,8 @@ function createApp() {
   const lastVisit = new Map<string, number>();
   let findSeq = 0;
   let findJump = false;
+  /** The text of the last search the user ran; sync re-runs repeat it, never text still being typed. */
+  let findSearched = "";
 
   // ------------------------------------------------------------------ account (Zero)
 
@@ -541,7 +543,7 @@ function createApp() {
           checkMissingRefs(ev.refs);
           restoreAnchor(anchor);
         }
-        if (find.open && find.text) void runFind(find.text, true);
+        if (find.open && findSearched) void runFind(findSearched, true);
         for (const w of [...waiters]) {
           const r = rows.index.get(w.hash) ?? (w.hash.length < 40 ? findPrefix(w.hash) : -1);
           if (r >= 0) {
@@ -865,8 +867,11 @@ function createApp() {
     const seq = ++findSeq;
     // A re-run after new rows (keepCurrent) can supersede the user's own search while it is in
     // flight; the jump that search owes must still happen.
-    if (!keepCurrent) findJump = true;
-    setFind("text", text);
+    if (!keepCurrent) {
+      findJump = true;
+      findSearched = text;
+      setFind("text", text);
+    }
     if (!text.trim()) {
       findJump = false;
       setFind({ matches: [], current: -1 });
