@@ -17,5 +17,5 @@
     "resolveJsonModule": true,
     "isolatedModules": true
   },
-  "include": ["src", "test", "scripts", "vite.config.ts", "playwright.config.ts"]
+  "include": ["src", "test", "scripts", ".storybook", "vite.config.ts", "vitest.storybook.config.ts", "playwright.config.ts"]
 }

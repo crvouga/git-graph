@@ -1,0 +1,23 @@
+import { Meta } from "@storybook/addon-docs/blocks";
+
+<Meta title="Docs/Introduction" />
+
+# Lanes UI
+
+Every story renders the real components against the real store and graph engine, reading a real
+(fixture) git repository through the in-browser git reader. Use the toolbar to switch between the
+dark and light themes, and the Accessibility panel to check each story.
+
+- **Foundations**: color tokens, lane palette, typography and icons. Use the tokens; never hard-code colors.
+- **App**: the whole shell in each URL state (graph, details, compare, diff, find, errors).
+- **Components**: pieces with their own states (control bar, ref badges).
+- **Overlays**: palette, context menus, dialogs, toasts, help and tooltips.
+
+## Working on the UI
+
+1. Find the story for what you are changing, or write one that shows the state first.
+2. Change the component here, in both themes.
+3. Cover new states with stories, with `play` functions for behaviour (`pnpm test:storybook`).
+4. `pnpm ui:compare` for before/after screenshots, then `pnpm ui:publish --pr <number>`.
+
+The full guide is `docs/ui-development.md` in the repository.

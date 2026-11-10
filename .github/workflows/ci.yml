@@ -104,12 +104,52 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  storybook:
+    name: Storybook stories and screenshots
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # ui:compare builds the PR's base commit
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Playwright version
+        id: pw
+        run: echo "version=$(pnpm exec playwright --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        id: pw-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
+      - if: steps.pw-cache.outputs.cache-hit != 'true'
+        run: pnpm exec playwright install --with-deps chromium
+      - if: steps.pw-cache.outputs.cache-hit == 'true'
+        run: pnpm exec playwright install-deps chromium
+      - run: pnpm test:storybook
+      # Before/after against the base branch on PRs (fails if a story errors); screenshots only on main.
+      - if: github.event_name == 'pull_request'
+        run: pnpm ui:compare --base ${{ github.event.pull_request.base.sha }}
+      - if: github.event_name != 'pull_request'
+        run: pnpm ui:shots --out .ui-shots/after --check
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ui-shots
+          path: .ui-shots/
+          include-hidden-files: true
+          retention-days: 14
+
   # The only check the main ruleset requires (see .github/repo-settings.json).
   # Add new jobs to `needs` instead of editing the ruleset.
   ci-ok:
     name: CI ok
     if: always()
-    needs: [test, e2e, build]
+    needs: [test, e2e, build, storybook]
     runs-on: ubuntu-latest
     steps:
       - name: All jobs passed

@@ -88,7 +88,12 @@ pnpm check                                 # typecheck
 pnpm test                                  # unit + property + adapter contract + real-git integration (vitest)
 node test/fixtures/make-fixtures.ts --large   # 100k-commit fixture (once)
 pnpm test:e2e                              # builds, then Playwright against the production build
+pnpm storybook                             # UI development: every component and state, real fixture repo
+pnpm test:storybook                        # every story as a browser test
+pnpm ui:compare                            # before/after screenshots of every story vs origin/main
 ```
+
+UI work is done in Storybook; see [docs/ui-development.md](docs/ui-development.md).
 
 All tests use disposable fixture repositories and a local bare remote; GitHub tests use a fake GitHub
 (OAuth with PKCE, private repos, webhooks). Nothing touches real repositories or github.com.

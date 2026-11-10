@@ -36,7 +36,7 @@ function onGlobalKey(e: KeyboardEvent) {
   }
 }
 
-function Home() {
+export function Home() {
   const [input, setInput] = createSignal("");
   let el!: HTMLInputElement;
   onMount(() => el.focus());
@@ -113,7 +113,7 @@ function Home() {
   );
 }
 
-function Banners() {
+export function Banners() {
   const err = () => app.repo.error;
   return (
     <>
@@ -179,14 +179,20 @@ function Banners() {
   );
 }
 
+/** The application: session check, companion pairing and opening the repository in the URL. */
 export function App() {
   onMount(() => {
-    window.addEventListener("keydown", onGlobalKey);
     void app.checkSession();
     void app.pairFromFragment().then(() => {
       if (app.view().repo) void app.openRepo(app.view());
     });
   });
+  return <AppShell />;
+}
+
+/** Layout and keyboard handling only, driven entirely by the store. Stories render this. */
+export function AppShell() {
+  onMount(() => window.addEventListener("keydown", onGlobalKey));
   onCleanup(() => window.removeEventListener("keydown", onGlobalKey));
   void registry;
   return (

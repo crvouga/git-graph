@@ -12,3 +12,5 @@ playwright-report
 .shot.mjs
 .perf.mjs
 .data
+storybook-static
+.ui-shots
