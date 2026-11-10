@@ -12,7 +12,7 @@ import { CommandRegistry, defineCommand, type AnyCommand, type MenuContext } fro
 import { repoCommands } from "../../core/commands/repo-commands.ts";
 import { AppError, type MutationResult, type Ref, type Worktree, type Remote, type RepoInfo } from "../../core/types.ts";
 import { buildUrl, parseGitHubInput, WORKING, type ViewState } from "../../core/url/state.ts";
-import { app, type DialogField, type MenuItem } from "./store.ts";
+import { app, DEFAULT_COLUMNS, type DialogField, type MenuItem } from "./store.ts";
 import type { RowCommit } from "../engine/protocol.ts";
 import { isReserved } from "./platform.ts";
 import { fsAccessSupported, newHandleId, saveHandle } from "./handles.ts";
@@ -644,7 +644,7 @@ function uiCommands(): UiCommand[] {
     ui({ id: "view.toggleAuthor", title: "Toggle Author Column", description: "Show or hide the Author column.", category: "View", execute: () => app.setColumns({ ...app.columns(), showAuthor: !app.columns().showAuthor }) }),
     ui({ id: "view.toggleHash", title: "Toggle Commit Column", description: "Show or hide the Commit column.", category: "View", execute: () => app.setColumns({ ...app.columns(), showHash: !app.columns().showHash }) }),
     ui({ id: "columns.resize", title: "Resize Columns…", description: "Focus the first column divider; use ←/→ to resize and Tab to move between dividers.", category: "View", execute: () => document.querySelector<HTMLElement>(".col-resizer")?.focus() }),
-    ui({ id: "columns.reset", title: "Reset Column Widths", description: "Restore default column widths.", category: "View", execute: () => app.setColumns({ graph: null, date: 124, author: 110, hash: 76, showDate: true, showAuthor: true, showHash: true }) }),
+    ui({ id: "columns.reset", title: "Reset Column Widths", description: "Restore default column widths.", category: "View", execute: () => app.setColumns(DEFAULT_COLUMNS) }),
     ui({ id: "theme.toggle", title: "Toggle Theme (System / Light / Dark)", description: "Cycle the color theme.", category: "View", execute: () => app.setTheme(app.theme() === "system" ? "light" : app.theme() === "light" ? "dark" : "system") }),
     ui({ id: "link.copy", title: "Copy Link to This View", description: "Copy a deep link that reproduces the current view.", category: "Links", shortcuts: ["y"], when: hasRepo, execute: () => copy(currentLink(), "link") }),
     ui({ id: "link.copyCommit", title: "Copy Link to Commit", description: "Copy a deep link to the focused commit.", category: "Links", contexts: ["commit"], when: hasRows, execute: () => {
