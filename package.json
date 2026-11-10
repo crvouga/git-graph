@@ -25,7 +25,10 @@
     "fixtures": "node test/fixtures/make-fixtures.ts",
     "perf": "node test/perf/run.ts",
     "test:all": "vitest run && pnpm test:e2e",
-    "check": "tsc --noEmit -p tsconfig.json"
+    "check": "tsc --noEmit -p tsconfig.json",
+    "github:plan": "node scripts/github-settings.ts --plan",
+    "github:check": "node scripts/github-settings.ts --check",
+    "github:apply": "node scripts/github-settings.ts"
   },
   "dependencies": {
     "@hono/node-server": "^2.1.6",

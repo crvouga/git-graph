@@ -4,28 +4,33 @@ on:
   push:
     branches: [main]
   pull_request:
+  merge_group:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+# New pushes to a PR cancel its older runs; runs on main always finish.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
     name: Typecheck, unit and integration (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-      - run: corepack enable
+          cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm check
       - run: node test/fixtures/make-fixtures.ts --large 20000
@@ -34,18 +39,31 @@ jobs:
   e2e:
     name: End-to-end against the production build
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-      - run: corepack enable
+          cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - run: pnpm exec playwright install --with-deps chromium
+      - name: Playwright version
+        id: pw
+        run: echo "version=$(pnpm exec playwright --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        id: pw-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
+      - if: steps.pw-cache.outputs.cache-hit != 'true'
+        run: pnpm exec playwright install --with-deps chromium
+      - if: steps.pw-cache.outputs.cache-hit == 'true'
+        run: pnpm exec playwright install-deps chromium
       - run: node test/fixtures/make-fixtures.ts --large
       - run: pnpm test:e2e
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: failure()
         with:
           name: e2e-results
           path: |
@@ -56,23 +74,44 @@ jobs:
   build:
     name: Production artifacts and container image
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: [test]
     steps:
       - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-      - run: corepack enable
+          cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
       - name: Smoke test the production server
         run: |
           PORT=8799 APP_ORIGIN=http://127.0.0.1:8799 SESSION_SECRET=ci-secret-ci-secret-ci-secret-0123456789 node dist/server/server.mjs &
-          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8799/health && break; sleep 0.5; done
+          for _ in $(seq 1 30); do curl -fsS http://127.0.0.1:8799/health && break; sleep 0.5; done
           curl -fsS http://127.0.0.1:8799/github/octo/repo | grep -q '<div id="app">'
       - uses: actions/upload-artifact@v4
         with:
           name: lanes-dist
           path: dist/
           retention-days: 14
-      - run: docker build -t lanes:ci .
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: lanes:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # The only check the main ruleset requires (see .github/repo-settings.json).
+  # Add new jobs to `needs` instead of editing the ruleset.
+  ci-ok:
+    name: CI ok
+    if: always()
+    needs: [test, e2e, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: All jobs passed
+        run: |
+          [ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped') }}" = "false" ]
