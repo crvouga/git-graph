@@ -477,7 +477,8 @@ function createApp() {
 
   function closeDetails() {
     const back = focusMemory.detailsFrom ?? view().commit;
-    navigate({ view: "graph", file: null, compare: null });
+    // Closing details clears the selection (Git Graph behaviour); the keyboard cursor stays put.
+    navigate({ view: "graph", file: null, compare: null, commit: null, selected: [] });
     if (back) {
       const r = rows.index.get(back);
       if (r !== undefined) setKbRow(r);

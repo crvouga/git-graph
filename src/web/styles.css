@@ -147,7 +147,7 @@ textarea {
 .controls {
   height: 40px;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr) auto minmax(max-content, 1fr);
   align-items: center;
   gap: 12px;
   padding: 0 8px;

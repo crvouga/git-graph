@@ -41,7 +41,7 @@ export function DiffView() {
   });
 
   const [sections] = createResource(
-    () => (conflicted() ? null : { c: v().commit, cmp: v().compare, f: v().file, st: isWorking() ? JSON.stringify(app.repo.status) : "", s: app.sessionId() }),
+    () => (conflicted() ? null : `${app.sessionId()}|${v().commit}|${v().compare}|${v().file}|${isWorking() ? JSON.stringify(app.repo.status) : ""}`),
     async (): Promise<Section[]> => {
       const p = path();
       if (isWorking()) {
@@ -63,7 +63,7 @@ export function DiffView() {
 
   // Sibling files for ]/[ navigation.
   const [siblings] = createResource(
-    () => ({ c: v().commit, cmp: v().compare, s: app.sessionId(), st: isWorking() ? JSON.stringify(app.repo.status) : "" }),
+    () => `${app.sessionId()}|${v().commit}|${v().compare}|${isWorking() ? JSON.stringify(app.repo.status) : ""}`,
     async (): Promise<string[]> => {
       if (isWorking()) {
         const s = app.repo.status;
@@ -279,8 +279,8 @@ export function DiffView() {
 
 function ConflictView(p: { path: string }) {
   const [data, { refetch }] = createResource(
-    () => ({ path: p.path, s: app.sessionId() }),
-    (x) => portCall<ConflictFile>("conflict", [x.path]),
+    () => `${app.sessionId()}|${p.path}`,
+    () => portCall<ConflictFile>("conflict", [p.path]),
   );
   const [text, setText] = createSignal("");
   createEffect(() => {

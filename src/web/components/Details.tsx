@@ -137,26 +137,34 @@ export function Details() {
   let listEl!: HTMLDivElement;
 
   const isWorking = () => v().commit === WORKING;
-  const pair = createMemo(() => {
-    const a = v().commit;
-    const b = v().compare;
-    if (!a || !b) return null;
-    // Compare older → newer regardless of the order they were selected in.
-    const ra = app.rows.index.get(a) ?? 0;
-    const rb = app.rows.index.get(b) ?? 0;
-    return ra > rb ? { base: a, head: b } : { base: b, head: a };
-  });
+  const pair = createMemo(
+    () => {
+      const a = v().commit;
+      const b = v().compare;
+      if (!a || !b) return null;
+      // Compare older → newer regardless of the order they were selected in.
+      const ra = app.rows.index.get(a) ?? 0;
+      const rb = app.rows.index.get(b) ?? 0;
+      return ra > rb ? { base: a, head: b } : { base: b, head: a };
+    },
+    undefined,
+    { equals: (x, y) => x?.base === y?.base && x?.head === y?.head },
+  );
 
   const [details] = createResource(
-    () => (!isWorking() && !v().compare && v().commit && app.repo.caps ? { h: v().commit!, s: app.sessionId() } : null),
-    async ({ h }) => {
+    () => (!isWorking() && !v().compare && v().commit && app.repo.caps ? `${app.sessionId()}|${v().commit}` : null),
+    async (key) => {
+      const h = key.split("|")[1]!;
       const full = app.rows.commits[app.rows.index.get(h) ?? -1]?.hash ?? h;
       return portCall<CommitDetails>("commit", [full]);
     },
   );
   const [comparison] = createResource(
-    () => (pair() && app.repo.caps ? { ...pair()!, s: app.sessionId() } : null),
-    async (p) => portCall<Diff>("diff", [{ kind: "compare", base: p.base, head: p.head }]),
+    () => (pair() && app.repo.caps ? `${app.sessionId()}|${pair()!.base}|${pair()!.head}` : null),
+    async (key) => {
+      const [, base, head] = key.split("|");
+      return portCall<Diff>("diff", [{ kind: "compare", base: base!, head: head! }]);
+    },
   );
 
   const files = createMemo<FileEntry[]>(() => {
@@ -172,6 +180,10 @@ export function Details() {
   });
 
   createEffect(on(() => `${v().commit}|${v().compare}`, () => setActive(0)));
+  // Focus moved to the list before files loaded: hand it to the first file once they arrive.
+  createEffect(() => {
+    if (items().length && document.activeElement === listEl) queueMicrotask(() => focusItem(active()));
+  });
 
   const reviewedCount = createMemo(() => {
     reviews();
@@ -364,7 +376,7 @@ export function Details() {
           </Show>
         </Show>
       </div>
-      <div class="files" ref={listEl} role="tree" aria-label="Changed files" onKeyDown={onKey}>
+      <div class="files" ref={listEl} role="tree" aria-label="Changed files" aria-busy={files().length === 0 && (details.loading || comparison.loading)} tabIndex={-1} onKeyDown={onKey}>
         <Show when={!isWorking() && files().length}>
           <div class="px-3 pb-1 text-xs text-muted" aria-live="polite">
             Reviewed {reviewedCount()} / {files().length}

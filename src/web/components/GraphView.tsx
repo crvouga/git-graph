@@ -237,7 +237,7 @@ export function GraphView() {
         onKeyDown={(e) => {
           // Tab from the graph goes straight to the changed-files list of the open details.
           if (e.key === "Tab" && !e.shiftKey && app.expandedRow() >= 0 && e.target === scroller) {
-            const f = scroller.querySelector<HTMLElement>('.details .files [tabindex="0"]');
+            const f = scroller.querySelector<HTMLElement>('.details .files [tabindex="0"]') ?? scroller.querySelector<HTMLElement>(".details .files");
             if (f) {
               e.preventDefault();
               f.focus();

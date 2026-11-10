@@ -415,10 +415,18 @@ export function FindWidget() {
           const v = e.currentTarget.value;
           app.setFind("text", v);
           if (t) clearTimeout(t);
-          t = setTimeout(() => void app.runFind(v), 120);
+          t = setTimeout(() => {
+            t = null;
+            void app.runFind(v);
+          }, 120);
         }}
         onKeyDown={(e) => {
-          if (e.key === "Enter") app.findStep(e.shiftKey ? -1 : 1);
+          if (e.key === "Enter" && t) {
+            // A search is still debounced: run it now (it jumps to the first match).
+            clearTimeout(t);
+            t = null;
+            void app.runFind(e.currentTarget.value);
+          } else if (e.key === "Enter") app.findStep(e.shiftKey ? -1 : 1);
           else if (e.key === "Escape") {
             app.setFind("open", false);
             app.focusGraph();
