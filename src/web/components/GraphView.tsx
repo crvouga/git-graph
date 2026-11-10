@@ -343,18 +343,13 @@ export function GraphView() {
               );
             }}
           </Index>
-          <Show when={!app.rows.complete && app.rows.length > 0}>
-            <div class="row" style={{ top: `${app.rowTop(app.rows.length)}px`, "padding-left": `${graphW() + 8}px`, color: "var(--fg-muted)" }} aria-live="polite">
-              Loading more commits…
-            </div>
-          </Show>
           <Show when={app.expandedRow() >= 0}>
             <div class="details" style={{ top: `${app.rowTop(app.expandedRow()) + ROW_H}px`, height: `${DETAILS_H}px`, left: `${graphW()}px` }}>
               <Details />
             </div>
           </Show>
         </div>
-        <Show when={app.rows.length === 0 && !app.repo.loading && !app.repo.error && app.repo.refs}>
+        <Show when={app.rows.length === 0 && app.rows.complete && !app.repo.error && app.repo.refs?.version}>
           <div class="p-6 text-muted">No commits to show{app.view().branches.length ? " for the selected branches" : ""}.</div>
         </Show>
       </div>

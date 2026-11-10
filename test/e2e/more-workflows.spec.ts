@@ -2,9 +2,11 @@
 import { expect, test } from "@playwright/test";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { cli, git, state } from "./harness.ts";
+import { AUTH_STATE, git, state } from "./harness.ts";
 import { makeBasic } from "../fixtures/make-fixtures.ts";
 import { dismissToasts, focusedRowSubject, MOD, palette, row, waitForGraph } from "./util.ts";
+
+test.use({ storageState: AUTH_STATE });
 
 test("clone → blame → interactive rebase (reword)", async ({ page }) => {
   const s = state();
@@ -13,9 +15,8 @@ test("clone → blame → interactive rebase (reword)", async ({ page }) => {
   const fx = makeBasic(root);
   const dest = join(root, "cloned repo");
 
-  const code = JSON.parse(cli(["pair", "--json"])).code as string;
-  await page.goto(`${s.appOrigin}/#pair=${code}&companion=${s.companionPort}`);
-  await expect(page.getByText("Connected to the local git-graph companion")).toBeVisible();
+  // Signed in to the account the companion is paired with; the clone runs on the companion.
+  await page.goto(`${s.appOrigin}/`);
 
   // Clone the fixture remote.
   await palette(page, "Clone Repository");

@@ -4,6 +4,7 @@
 // 5 not found, 6 unauthenticated, 7 companion unreachable.
 
 import { spawn } from "node:child_process";
+import { hostname } from "node:os";
 import { existsSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -12,7 +13,7 @@ import { AppError, parseRepoKey, repoKey, type ErrorCode, type EventEnvelope, ty
 import { describeCommand, executeCommand, type ExecuteResponse } from "../core/commands/registry.ts";
 import { HttpApi, subscribeEvents } from "../core/api/client.ts";
 import { parseGitHubInput } from "../core/url/state.ts";
-import { DEFAULT_APP_ORIGIN, DEFAULT_PORT, readConfig, rememberRepo, repoIdFor } from "../companion/config.ts";
+import { DEFAULT_APP_ORIGIN, DEFAULT_PORT, readConfig, rememberRepo, repoIdFor, updateConfig, type ServerAgent } from "../companion/config.ts";
 import { createCompanionRegistry } from "../companion/commands.ts";
 import { LocalRepos } from "../companion/local-repos.ts";
 import { locateRepository } from "../companion/git-adapter.ts";
@@ -49,12 +50,13 @@ const HELP = `git-graph — Lanes, a fast keyboard-first Git graph
 
 Usage:
   git-graph open [path|owner/repo|github-url] [--branch b] [--commit h] [--provider github]
-                 [--app-origin URL] [--no-browser] [--json]
-  git-graph compare <a> <b> [path] [--repo path] [--no-browser] [--json]
+                 [--app-origin URL] [--no-pair] [--no-browser] [--json]
+  git-graph compare <a> <b> [path] [--repo path] [--app-origin URL] [--no-pair] [--no-browser] [--json]
   git-graph url --repo <key|owner/repo|path> [--commit h] [--compare h] [--branch b] [--file p] [--json]
   git-graph commands [--json]
   git-graph exec <command-id> [--json '<args>'] [--confirm <token>] [--repo path|key] [--server URL]
-  git-graph pair [--json]
+  git-graph pair [--server URL] [--no-browser] [--json]
+  git-graph pair --local [--json]
   git-graph events [--repo path|key] [--cursor c] [--max-events n] [--timeout ms]
   git-graph run [--repo path] -- <git args...>
   git-graph serve [--port n] [--allow-origin URL ...] [--app-origin URL]
@@ -62,7 +64,13 @@ Usage:
 
 Exit codes: 0 ok, 1 error, 2 usage, 3 confirmation required, 4 unsupported,
             5 not found, 6 unauthenticated, 7 companion unreachable.
-Destructive commands never run without --confirm <token> (there is no --yes).`;
+Destructive commands never run without --confirm <token> (there is no --yes).
+
+Local repositories reach the web app through the Lanes server: \`git-graph pair\` registers this
+companion with the server (default: $LANES_APP_ORIGIN, else the server you paired with, else
+${DEFAULT_APP_ORIGIN}) and opens a link that binds it to your signed-in account. \`open\` and
+\`compare\` do this automatically when the companion is not paired yet (--no-pair skips it).
+\`pair --local\` prints a one-time code for the companion's localhost API instead.`;
 
 interface Out {
   json: boolean;
@@ -163,7 +171,7 @@ function unwrap<T>(r: ExecuteResponse): T {
 /** Compute a local key without the companion and register the path so the companion can serve it. */
 async function localKeyFor(path: string): Promise<string> {
   const loc = await locateRepository(path);
-  const id = repoIdFor(loc.toplevel);
+  const id = repoIdFor(readConfig().installId, loc.toplevel);
   rememberRepo(id, { path: loc.toplevel, commonDir: loc.commonDir });
   return `local:${id}`;
 }
@@ -191,8 +199,122 @@ async function resolveCommitish(path: string, rev: string): Promise<string> {
   return r.stdout.trim();
 }
 
+/** The Lanes web app / server: flag, $LANES_APP_ORIGIN, the server this companion is paired with, default. */
 function appOrigin(flag?: string): string {
-  return (flag ?? process.env.LANES_APP_ORIGIN ?? DEFAULT_APP_ORIGIN).replace(/\/+$/, "");
+  return (flag || process.env.LANES_APP_ORIGIN || readConfig().server?.url || DEFAULT_APP_ORIGIN).replace(/\/+$/, "");
+}
+
+// ---------------------------------------------------------------------------
+// Pairing with the hosted server (the companion is a Zero source agent there)
+// ---------------------------------------------------------------------------
+
+interface PairCode {
+  agentId: string;
+  code: string;
+  pairUrl: string;
+  expiresAt: number;
+  registered: boolean;
+}
+
+async function serverCall<T>(server: string, path: string, init: { method: "GET" | "POST"; token?: string; body?: unknown }): Promise<T> {
+  let res: Response;
+  try {
+    res = await fetch(`${server}${path}`, {
+      method: init.method,
+      headers: { ...(init.token ? { authorization: `Bearer ${init.token}` } : {}), ...(init.body !== undefined ? { "content-type": "application/json" } : {}) },
+      ...(init.body !== undefined ? { body: JSON.stringify(init.body) } : {}),
+      signal: AbortSignal.timeout(15_000),
+    });
+  } catch (e) {
+    throw new AppError("OFFLINE", `Cannot reach the Lanes server at ${server}: ${e instanceof Error ? e.message : e}`);
+  }
+  const body = (await res.json().catch(() => null)) as (T & { error?: unknown }) | null;
+  if (!res.ok || !body) {
+    if (res.status === 401) throw new AppError("UNAUTHENTICATED", (body?.error as { message?: string } | undefined)?.message ?? "The server does not recognise this companion");
+    throw AppError.from(body?.error ?? { code: "UPSTREAM_ERROR", message: `${server}${path}: HTTP ${res.status}` });
+  }
+  return body;
+}
+
+async function registerWith(server: string): Promise<PairCode> {
+  const r = await serverCall<{ agentId: string; token: string; code: string; pairUrl: string; expiresAt: number }>(server, "/agent-api/v1/register", {
+    method: "POST",
+    body: { name: hostname() || "Companion" },
+  });
+  const entry: ServerAgent = { url: server, agentId: r.agentId, token: r.token };
+  updateConfig((c) => {
+    c.server = entry;
+  });
+  return { agentId: r.agentId, code: r.code, pairUrl: r.pairUrl, expiresAt: r.expiresAt, registered: true };
+}
+
+/** A fresh pairing code for `server`, registering this companion there first if needed. */
+async function newPairCode(server: string): Promise<PairCode> {
+  const cur = readConfig().server;
+  if (!cur || cur.url !== server) return registerWith(server);
+  try {
+    const r = await serverCall<{ agentId: string; code: string; pairUrl: string; expiresAt: number }>(server, "/agent-api/v1/pair", { method: "POST", token: cur.token });
+    return { ...r, registered: false };
+  } catch (e) {
+    if (AppError.from(e).code === "UNAUTHENTICATED") return registerWith(server); // the server forgot us
+    throw e;
+  }
+}
+
+/** Null when this companion is already paired with an account on `server`; else a pairing code. */
+async function pairIfNeeded(server: string): Promise<PairCode | null> {
+  const cur = readConfig().server;
+  if (cur && cur.url === server) {
+    try {
+      const me = await serverCall<{ paired: boolean }>(server, "/agent-api/v1/me", { method: "GET", token: cur.token });
+      if (me.paired) return null;
+    } catch (e) {
+      if (AppError.from(e).code !== "UNAUTHENTICATED") throw e;
+    }
+  }
+  return newPairCode(server);
+}
+
+/** Ask a running companion to (re)start its source agent from the config. */
+async function reloadCompanionAgent(base: string): Promise<unknown> {
+  const token = readConfig().token;
+  const res = await fetch(`${base}/agent/reload`, { method: "POST", headers: { authorization: `Bearer ${token}` } }).catch(() => null);
+  const body = (await res?.json().catch(() => null)) as { status?: unknown } | null;
+  return body?.status ?? null;
+}
+
+/** The companion's source agent should be running for the paired server; start it if not. */
+async function ensureCompanionAgent(base: string) {
+  const token = readConfig().token;
+  const res = await fetch(`${base}/agent`, { headers: { authorization: `Bearer ${token}` } }).catch(() => null);
+  const body = (await res?.json().catch(() => null)) as { enabled?: boolean; status?: { state?: string; agentId?: string; url?: string } | null } | null;
+  const cfg = readConfig().server;
+  if (!body?.enabled || !cfg) return;
+  const s = body.status;
+  if (!s || s.agentId !== cfg.agentId || s.url !== cfg.url || s.state === "unauthorized" || s.state === "error" || s.state === "stopped") await reloadCompanionAgent(base);
+}
+
+function withClaim(link: string, code: string): string {
+  return `${link}${link.includes("#") ? "&" : "#"}claim=${encodeURIComponent(code)}`;
+}
+
+/**
+ * Make sure the web app can see local repositories: the companion is registered with and paired to
+ * the server, and its agent runs. Returns the claim code to put in the link when pairing is needed.
+ * Server problems are reported but do not stop `open` (the link is still printed).
+ */
+async function preparePairing(base: string, server: string, skip: boolean): Promise<{ claim: string | null; warning?: string }> {
+  if (skip) return { claim: null };
+  try {
+    const p = await pairIfNeeded(server);
+    if (p) await reloadCompanionAgent(base);
+    else await ensureCompanionAgent(base);
+    return { claim: p?.code ?? null };
+  } catch (e) {
+    const err = AppError.from(e);
+    process.stderr.write(`warning: could not pair with ${server}: ${err.message}\n`);
+    return { claim: null, warning: err.message };
+  }
 }
 
 async function buildLink(origin: string, args: Record<string, unknown>): Promise<string> {
@@ -223,6 +345,7 @@ async function cmdOpen(argv: string[]): Promise<number> {
     commit: { type: "string" },
     provider: { type: "string" },
     "app-origin": { type: "string" },
+    "no-pair": { type: "boolean" },
     "no-browser": { type: "boolean" },
     json: { type: "boolean" },
   });
@@ -248,32 +371,33 @@ async function cmdOpen(argv: string[]): Promise<number> {
     const info = unwrap<RepoInfo>(await executeRemote(companionApi(base), "local.open", { path }));
     const commit = values.commit ? await resolveCommitish(path, values.commit) : undefined;
     const link = await buildLink(origin, { repo: info.key, ...(values.branch ? { branches: [values.branch], focusBranch: values.branch } : {}), ...(commit ? { commit } : {}) });
-    const pair = await pairingCode(base);
-    url = `${link}#pair=${pair.code}${companionFragment(base)}`;
-    extra = { key: info.key, path: info.worktreePath, companion: base, pairExpiresAt: pair.expiresAt };
+    const p = await preparePairing(base, origin, !!values["no-pair"]);
+    url = p.claim ? withClaim(link, p.claim) : link;
+    extra = { key: info.key, path: info.worktreePath, companion: base, paired: !p.claim && !p.warning && !values["no-pair"], ...(p.warning ? { warning: p.warning } : {}) };
   }
   if (!values["no-browser"]) openBrowser(url);
   print(out, url, { url, ...extra });
   return EXIT.ok;
 }
 
-/** Tell the web app which localhost port the companion listens on when it is not the default. */
-function companionFragment(base: string): string {
-  const port = new URL(base).port;
-  return port && port !== "7420" ? `&companion=${port}` : "";
-}
-
 async function cmdCompare(argv: string[]): Promise<number> {
-  const { values, positionals } = parse(argv, { repo: { type: "string" }, "app-origin": { type: "string" }, "no-browser": { type: "boolean" }, json: { type: "boolean" } });
+  const { values, positionals } = parse(argv, {
+    repo: { type: "string" },
+    "app-origin": { type: "string" },
+    "no-pair": { type: "boolean" },
+    "no-browser": { type: "boolean" },
+    json: { type: "boolean" },
+  });
   if (positionals.length < 2) throw new UsageError("compare needs <a> <b> [path]");
   const [a, b, file] = positionals as [string, string, string | undefined];
   const path = resolve(values.repo ?? ".");
   const [ha, hb] = await Promise.all([resolveCommitish(path, a), resolveCommitish(path, b)]);
   const base = await ensureCompanion();
   const info = unwrap<RepoInfo>(await executeRemote(companionApi(base), "local.open", { path }));
-  const link = await buildLink(appOrigin(values["app-origin"]), { repo: info.key, commit: ha, compare: hb, ...(file ? { file, view: "diff" } : {}) });
-  const pair = await pairingCode(base);
-  const url = `${link}#pair=${pair.code}${companionFragment(base)}`;
+  const origin = appOrigin(values["app-origin"]);
+  const link = await buildLink(origin, { repo: info.key, commit: ha, compare: hb, ...(file ? { file, view: "diff" } : {}) });
+  const p = await preparePairing(base, origin, !!values["no-pair"]);
+  const url = p.claim ? withClaim(link, p.claim) : link;
   if (!values["no-browser"]) openBrowser(url);
   print({ json: !!values.json }, url, { url, key: info.key });
   return EXIT.ok;
@@ -395,10 +519,20 @@ async function cmdExec(argv: string[]): Promise<number> {
 }
 
 async function cmdPair(argv: string[]): Promise<number> {
-  const { values } = parse(argv, { json: { type: "boolean" } }, false);
+  const { values } = parse(argv, { json: { type: "boolean" }, local: { type: "boolean" }, server: { type: "string" }, "no-browser": { type: "boolean" } }, false);
+  const out = { json: !!values.json };
   const base = await ensureCompanion();
-  const p = await pairingCode(base);
-  print({ json: !!values.json }, p.code, { ...p, companion: base });
+  if (values.local) {
+    const p = await pairingCode(base);
+    print(out, p.code, { ...p, companion: base });
+    return EXIT.ok;
+  }
+  const server = appOrigin(values.server);
+  const p = await newPairCode(server);
+  const agent = await reloadCompanionAgent(base);
+  if (!values["no-browser"]) openBrowser(p.pairUrl);
+  const human = `Open this link while signed in to ${server} to pair this computer (expires ${new Date(p.expiresAt).toLocaleTimeString()}):\n${p.pairUrl}`;
+  print(out, human, { server, agentId: p.agentId, registered: p.registered, code: p.code, pairUrl: p.pairUrl, expiresAt: p.expiresAt, companion: base, agent });
   return EXIT.ok;
 }
 

@@ -8,7 +8,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { ROOT, makeBasic, type BasicFixture } from "../fixtures/make-fixtures.ts";
-import { repoIdFor } from "../../src/companion/config.ts";
+import { readConfig, repoIdFor } from "../../src/companion/config.ts";
 
 const CLI = resolve(import.meta.dirname, "../../src/cli/main.ts");
 
@@ -33,7 +33,7 @@ describe("MCP server (stdio)", () => {
     }
     process.env.GIT_CONFIG_GLOBAL = cfg;
     fx = makeBasic(root);
-    key = `local:${repoIdFor(realpathSync(fx.repo))}`;
+    key = `local:${repoIdFor(readConfig(join(root, "cfg")).installId, realpathSync(fx.repo))}`;
     const env: Record<string, string> = {};
     for (const [k, v] of Object.entries(process.env)) if (v !== undefined) env[k] = v;
     Object.assign(env, { GIT_CONFIG_GLOBAL: cfg, GIT_CONFIG_NOSYSTEM: "1", LANES_CONFIG_DIR: join(root, "cfg"), LANES_APP_ORIGIN: "https://lanes.example.com", LANES_SERVER_URL: "" });

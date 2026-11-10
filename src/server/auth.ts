@@ -171,6 +171,36 @@ export class Auth {
     }
   }
 
+  /** Name of the readable (not HttpOnly) cookie that tells the web client who it is at startup. */
+  get bootCookieName(): string {
+    return this.secure ? "__Host-lanes_boot" : this.cookieName.replace("session", "boot");
+  }
+
+  /**
+   * After an HTML or /auth response: keep the boot cookie in step with the session. Its value is
+   * "<account id or empty>.<login enabled><github enabled>", read synchronously by the web client
+   * to start Zero with the right user (no session request, nothing to wait for). Not a credential.
+   */
+  commitBoot(c: Context): void {
+    const s = this.readSession(c);
+    const uid = s && !this.o.sessions.isEnded(s) ? (s.accountId ?? "") : "";
+    const want = `${uid}.${this.loginEnabled ? 1 : 0}${this.githubEnabled ? 1 : 0}`;
+    if (getCookie(c, this.bootCookieName) === want) return;
+    const header = generateCookie(this.bootCookieName, want, {
+      path: "/",
+      httpOnly: false,
+      secure: this.secure,
+      sameSite: "Lax",
+      maxAge: Math.floor(this.o.config.sessionAbsoluteTtlMs / 1000),
+    });
+    try {
+      c.res.headers.append("set-cookie", header);
+    } catch {
+      c.res = new Response(c.res.body, c.res);
+      c.res.headers.append("set-cookie", header);
+    }
+  }
+
   expiresAt(s: Session): number {
     return Math.min(s.lastSeenAt + this.o.config.sessionIdleTtlMs, s.createdAt + this.o.config.sessionAbsoluteTtlMs);
   }

@@ -1,22 +1,7 @@
-// Messages between the UI thread and the graph engine worker.
+// Messages between the UI thread and the graph engine worker. The worker only computes: commits,
+// refs and status come from Zero on the UI thread; it answers with ordered rows and their layout.
 
-import type { Capabilities, Commit, HistoryQuery, RefsSnapshot, RepoInfo, RepositoryEvent, WorkingTreeStatus } from "../../core/types.ts";
-
-export type SourceConfig =
-  | { kind: "server"; baseUrl: string }
-  | { kind: "companion"; baseUrl: string; token: string }
-  | { kind: "fs"; handle: FileSystemDirectoryHandle };
-
-export interface OpenArgs {
-  session: number;
-  repoKey: string;
-  source: SourceConfig;
-  query: HistoryQuery;
-  /** Rows to load before the first `rows` message (at least one page). */
-  initial: number;
-  /** Hash to make sure is loaded (deep link to a commit deep in history). */
-  ensure?: string | null;
-}
+import type { Commit, HistoryQuery, RefsSnapshot, WorkingTreeStatus } from "../../core/types.ts";
 
 export interface LayoutChunk {
   from: number;
@@ -41,6 +26,7 @@ export type RowsMessage =
   /** Replace the first `removeTop` rows with `insert`, and the whole layout with `layout` (from = 0). */
   | { t: "rows"; session: number; kind: "splice"; removeTop: number; insert: RowCommit[]; layout: LayoutChunk; complete: boolean; refs: RefsSnapshot; reusedRows: number };
 
+/** Freshness of the open repository, as the UI shows it (from the agent's sync state and Zero). */
 export interface SyncInfo {
   connection: "live" | "polling" | "connecting" | "offline" | "idle";
   lastSuccessAt: number | null;
@@ -49,29 +35,24 @@ export interface SyncInfo {
   fromCache: boolean;
   refsVersion: string | null;
   pending: number;
-  /** Is this tab holding the shared real-time subscription for the repo? */
   leader: boolean;
 }
 
-export type EngineEvent =
-  | RowsMessage
-  | { t: "sync"; session: number; sync: SyncInfo }
-  | { t: "repo"; session: number; info: RepoInfo; caps: Capabilities }
-  | { t: "status"; session: number; status: WorkingTreeStatus | null }
-  | { t: "event"; session: number; event: RepositoryEvent }
-  | { t: "metric"; name: string; value: number; session: number }
-  | { t: "error"; session: number; error: { code: string; message: string } };
+export interface GraphState {
+  refs: RefsSnapshot | null;
+  query: HistoryQuery;
+  status: WorkingTreeStatus | null;
+  complete: boolean;
+}
+
+export type EngineEvent = RowsMessage | { t: "metric"; name: string; value: number; session: number };
 
 export type EngineCall =
-  | { method: "open"; args: OpenArgs }
-  | { method: "close"; args: { session: number } }
-  | { method: "loadMore"; args: { session: number; count: number } }
-  | { method: "ensure"; args: { session: number; hash: string; maxRows?: number } }
-  | { method: "refresh"; args: { session: number; reason: string; force?: boolean } }
-  | { method: "search"; args: { session: number; text: string; limit?: number } }
-  | { method: "port"; args: { session: number; name: string; params: unknown[] } }
-  | { method: "execute"; args: { session: number; command: string; params: unknown; confirm?: string } }
-  | { method: "visibility"; args: { visible: boolean; focused: boolean; online: boolean } };
+  /** Start over for another repository (generation = the UI's session number). */
+  | { method: "reset"; args: { session: number } }
+  | { method: "commits"; args: { session: number; add: Commit[]; remove: string[] } }
+  | { method: "state"; args: { session: number; state: GraphState } }
+  | { method: "search"; args: { session: number; text: string; refs?: Record<string, string[]> } };
 
 export type CallMessage = { t: "call"; id: number } & EngineCall;
 export type CancelMessage = { t: "cancel"; id: number };

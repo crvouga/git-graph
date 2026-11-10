@@ -63,6 +63,13 @@ export const VAULT_KEYS: readonly VaultKey[] = [
     purpose: "Shared PostgreSQL connection URL (already in Vault); Lanes uses only its allocated schema.",
   },
   {
+    env: "ZERO_API_KEY",
+    vault: "LANES_ZERO_API_KEY",
+    required: true,
+    check: (v) => (v.trim().length >= 16 ? null : "must be at least 16 characters (openssl rand -base64 32)"),
+    purpose: "Shared key between the Lanes server and the zero-cache sidecar (X-Api-Key on /internal/zero/*). Generate with `openssl rand -base64 32`; keep it stable.",
+  },
+  {
     env: "GITHUB_PUBLIC_TOKEN",
     vault: "LANES_GITHUB_PUBLIC_TOKEN",
     required: false,

@@ -1,4 +1,5 @@
-// Companion configuration: bearer token, port, and the id -> worktree path registry.
+// Companion configuration: bearer token, port, install id, the hosted-server agent credentials and
+// the id -> worktree path registry.
 // Stored in $LANES_CONFIG_DIR/companion.json (default ~/.config/lanes, honoring XDG_CONFIG_HOME),
 // directory mode 0700, file mode 0600, written atomically (temp file + rename).
 
@@ -18,10 +19,22 @@ export interface RepoEntry {
   lastOpenedAt: number;
 }
 
+/** This companion's registration with a hosted Lanes server (a Zero source agent). */
+export interface ServerAgent {
+  /** App origin of the server (Zero sync is at `${url}/zero`). */
+  url: string;
+  agentId: string;
+  /** Agent token (secret; only ever sent to `url`). */
+  token: string;
+}
+
 export interface CompanionConfig {
   version: 1;
   token: string;
+  /** Random per-install id; mixed into repository ids so they are unique across machines. */
+  installId: string;
   port?: number;
+  server?: ServerAgent;
   repos: Record<string, RepoEntry>;
   /** Most recent first. */
   recent: string[];
@@ -41,13 +54,42 @@ export function newToken(): string {
   return randomBytes(32).toString("base64url");
 }
 
-/** Stable repository id: first 16 chars of base64url(sha256(realpath(toplevel))). */
-export function repoIdFor(realToplevel: string): string {
-  return createHash("sha256").update(realToplevel).digest("base64url").slice(0, 16);
+export function newInstallId(): string {
+  return randomBytes(16).toString("base64url");
+}
+
+/**
+ * Stable repository id, unique across installs: first 16 chars of
+ * base64url(sha256(installId + "\0" + realpath(toplevel))).
+ */
+export function repoIdFor(installId: string, realToplevel: string): string {
+  return createHash("sha256").update(installId).update("\0").update(realToplevel).digest("base64url").slice(0, 16);
 }
 
 function fresh(): CompanionConfig {
-  return { version: 1, token: newToken(), repos: {}, recent: [] };
+  return { version: 1, token: newToken(), installId: newInstallId(), repos: {}, recent: [] };
+}
+
+function parseServer(v: unknown): ServerAgent | undefined {
+  if (!v || typeof v !== "object") return undefined;
+  const o = v as Record<string, unknown>;
+  if (typeof o.url !== "string" || typeof o.agentId !== "string" || typeof o.token !== "string") return undefined;
+  if (!o.url || !o.agentId || !o.token) return undefined;
+  return { url: o.url.replace(/\/+$/, ""), agentId: o.agentId, token: o.token };
+}
+
+/** Configs from before install ids: re-key the remembered repositories with the new install id. */
+function migrateIds(c: CompanionConfig) {
+  const map = new Map<string, string>();
+  const repos: Record<string, RepoEntry> = {};
+  for (const [old, e] of Object.entries(c.repos)) {
+    if (!e || typeof e.path !== "string") continue;
+    const id = repoIdFor(c.installId, e.path);
+    map.set(old, id);
+    repos[id] = e;
+  }
+  c.repos = repos;
+  c.recent = c.recent.flatMap((x) => (map.has(x) ? [map.get(x)!] : []));
 }
 
 export function readConfig(dir = configDir()): CompanionConfig {
@@ -62,11 +104,15 @@ export function readConfig(dir = configDir()): CompanionConfig {
     const c: CompanionConfig = {
       version: 1,
       token: typeof raw.token === "string" && raw.token.length >= 32 ? raw.token : newToken(),
+      installId: typeof raw.installId === "string" && raw.installId.length >= 16 ? raw.installId : newInstallId(),
       ...(typeof raw.port === "number" ? { port: raw.port } : {}),
       repos: raw.repos && typeof raw.repos === "object" ? raw.repos : {},
       recent: Array.isArray(raw.recent) ? raw.recent.filter((x): x is string => typeof x === "string") : [],
     };
-    if (c.token !== raw.token) writeConfig(c, dir);
+    if (c.installId !== raw.installId) migrateIds(c);
+    const server = parseServer(raw.server);
+    if (server) c.server = server;
+    if (c.token !== raw.token || c.installId !== raw.installId) writeConfig(c, dir);
     return c;
   } catch {
     // Corrupt file: start over rather than crash (repos can be re-opened).

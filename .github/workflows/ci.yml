@@ -34,6 +34,14 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm check
       - run: node test/fixtures/make-fixtures.ts --large 20000
+      # PostgreSQL with logical replication for the Zero end-to-end test (Linux runners have Docker).
+      - name: PostgreSQL for Zero sync
+        if: runner.os == 'Linux'
+        run: |
+          docker run -d --name pg -p 55432:5432 -e POSTGRES_PASSWORD=pass postgres:17 -c wal_level=logical
+          for i in $(seq 1 30); do docker exec pg pg_isready -U postgres && break; sleep 1; done
+          docker exec pg psql -U postgres -c 'create schema lanes'
+          echo "LANES_ZERO_TEST_DB=postgres://postgres:pass@localhost:55432/postgres" >> "$GITHUB_ENV"
       - run: pnpm test
 
   e2e:
@@ -61,6 +69,12 @@ jobs:
       - if: steps.pw-cache.outputs.cache-hit == 'true'
         run: pnpm exec playwright install-deps chromium
       - run: node test/fixtures/make-fixtures.ts --large
+      - name: PostgreSQL for Zero sync
+        run: |
+          docker run -d --name pg -p 55432:5432 -e POSTGRES_PASSWORD=pass postgres:17 -c wal_level=logical
+          for i in $(seq 1 30); do docker exec pg pg_isready -U postgres && break; sleep 1; done
+          docker exec pg psql -U postgres -c 'create schema lanes'
+          echo "LANES_ZERO_TEST_DB=postgres://postgres:pass@localhost:55432/postgres" >> "$GITHUB_ENV"
       - run: pnpm test:e2e
       - uses: actions/upload-artifact@v4
         if: failure()

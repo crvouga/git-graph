@@ -17,6 +17,8 @@ export interface Db extends Queryable {
   t(table: string): string;
   readonly schema: string;
   transaction<T>(fn: (q: Queryable) => Promise<T>): Promise<T>;
+  /** The underlying postgres.js client (Zero's mutation transactions run on it). */
+  readonly sql: postgres.Sql;
   close(): Promise<void>;
 }
 
@@ -58,6 +60,7 @@ export function connectDb(url: string, opts: DbOptions): Db {
   const run = async <T>(q: { unsafe: typeof sql.unsafe }, text: string, params: unknown[] = []): Promise<T[]> =>
     (await q.unsafe(text, params as never[])) as unknown as T[];
   return {
+    sql,
     schema: opts.schema,
     t: (table) => `${schema}.${quoteIdent(table)}`,
     async query<T>(text: string, params?: unknown[]) {

@@ -1,11 +1,12 @@
 // Fuzzy command palette. Modes: commands, repositories, branch filter, worktrees.
 // Every item shows its target, shortcut and (when disabled) the reason.
 
-import { createEffect, createMemo, createResource, createSignal, For, onMount, Show } from "solid-js";
+import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show } from "solid-js";
 import { AppError, type RepoInfo, type Worktree } from "../../core/types.ts";
 import { parseGitHubInput } from "../../core/url/state.ts";
 import { app } from "../app/store.ts";
-import { commandAvailability, commandTarget, commandTitle, currentContext, executeRemote, invoke, invokeMutation, openGitHubInput, openMenu, openWorktreePath, paletteCommands, portCall } from "../app/commands.ts";
+import { commandAvailability, commandTarget, commandTitle, currentContext, executeRemote, invoke, invokeMutation, openGitHubInput, openMenu, onlineCompanion, companionCommand, openWorktreePath, paletteCommands } from "../app/commands.ts";
+import { useRead } from "../app/sync.ts";
 import { formatShortcut } from "../app/platform.ts";
 
 export function fuzzyScore(query: string, text: string): number {
@@ -53,17 +54,21 @@ export function Palette() {
     if (refocus) app.restoreFocus(() => (restore && restore !== document.body ? restore : null));
   };
 
-  const [ghRepos] = createResource(
-    () => (mode() === "repos" && app.auth.authenticated ? q() : null),
-    async (query) => {
-      const res = await fetch(`/api/v1/repositories?limit=30${query ? `&query=${encodeURIComponent(query)}` : ""}`, { credentials: "include" });
-      return res.ok ? ((await res.json()) as RepoInfo[]) : [];
-    },
+  // "My GitHub repositories" and worktrees are reads through Zero; the list shows what has arrived.
+  const [ghQuery, setGhQuery] = createSignal(q().trim());
+  let ghTimer: ReturnType<typeof setTimeout> | undefined;
+  createEffect(() => {
+    const text = q().trim();
+    clearTimeout(ghTimer);
+    ghTimer = setTimeout(() => setGhQuery(text), 250);
+  });
+  onCleanup(() => clearTimeout(ghTimer));
+  const ghRead = useRead<RepoInfo[]>(() =>
+    mode() === "repos" && app.auth.github?.connected ? { repoId: "github", method: "repositories", params: [{ limit: 30, ...(ghQuery() ? { query: ghQuery() } : {}) }], personal: true } : null,
   );
-  const [worktrees] = createResource(
-    () => (mode() === "worktrees" ? app.sessionId() : null),
-    () => portCall<Worktree[]>("worktrees", []),
-  );
+  const ghRepos = () => ghRead.value() ?? [];
+  const wtRead = useRead<Worktree[]>(() => (mode() === "worktrees" && app.repoId() ? { repoId: app.repoId()!, method: "worktrees", params: [], live: true } : null));
+  const worktrees = Object.assign(() => wtRead.value(), { get error() { return wtRead.error(); } });
 
   const items = createMemo<Item[]>(() => {
     const m = mode();
@@ -96,8 +101,8 @@ export function Palette() {
         out.push({
           key: "local-open",
           label: `Open local path ${text}`,
-          detail: app.companion().token ? "via the git-graph companion" : undefined,
-          disabled: app.companion().token ? null : "Connect the local companion first (run `git-graph open <path>` or use “Connect Local Companion…”)",
+          detail: onlineCompanion() ? "via the git-graph companion" : undefined,
+          disabled: onlineCompanion() ? null : "No companion is online (run `git-graph open <path>` on your computer, or use “Connect Local Companion…”)",
           run: () => (close(false), void openLocalPath(text)),
         });
       }
@@ -245,7 +250,7 @@ export function Palette() {
           autocomplete="off"
         />
         <div ref={listEl} id="palette-list" role="listbox" class="max-h-[60vh] overflow-auto px-1 pb-1">
-          <For each={filtered()} fallback={<div class="px-3 py-2 text-muted">{worktrees.loading ? "Loading…" : worktrees.error ? AppError.from(worktrees.error).message : "No matches"}</div>}>
+          <For each={filtered()} fallback={<div class="px-3 py-2 text-muted">{worktrees.error ? AppError.from(worktrees.error).message : "No matches"}</div>}>
             {(it, i) => (
               <div
                 id={`pal-${i()}`}
@@ -289,21 +294,7 @@ export function Palette() {
   );
 }
 
-async function openLocalPath(path: string) {
-  if (!app.companion().token) return;
-  try {
-    const res = await fetch(`${app.companion().baseUrl}/api/v1/commands/execute`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${app.companion().token}`, "x-client": "ui" },
-      body: JSON.stringify({ command: "local.open", args: { path } }),
-    });
-    const body = (await res.json()) as { ok: boolean; result?: RepoInfo; error?: { message: string } };
-    if (!body.ok || !body.result) throw new Error(body.error?.message ?? `HTTP ${res.status}`);
-    const info = body.result;
-    app.rememberRecent({ key: info.key, name: info.name, path: info.worktreePath, at: Date.now() });
-    app.navigate({ ...app.view(), repo: { provider: "local", id: info.key.split(":")[1]! }, branches: [], commit: null, compare: null, selected: [], view: "graph", file: null, at: null, worktree: null });
-  } catch (e) {
-    app.toast("error", `Could not open ${path}`, e instanceof Error ? e.message : String(e));
-  }
+function openLocalPath(path: string) {
+  return companionCommand("local.open", { path }, `Open ${path}`);
 }
 export { executeRemote, openLocalPath };

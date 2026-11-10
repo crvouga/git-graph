@@ -25,6 +25,10 @@ import { Poller } from "./sync/poller.ts";
 import { Reconciler } from "./sync/reconciler.ts";
 import { SubscriptionRegistry, type Principal } from "./sync/subscriptions.ts";
 import { Webhooks } from "./sync/webhooks.ts";
+import { GitHubAgent } from "./zero/github-agent.ts";
+import { createZeroRoutes, startZeroCache, zeroHttpProxy, zeroUpgradeProxy, type ZeroCacheHandle } from "./zero/server.ts";
+import type { IncomingMessage } from "node:http";
+import type { Duplex } from "node:stream";
 
 export interface ServerApp {
   app: Hono;
@@ -39,6 +43,12 @@ export interface ServerApp {
   webhooks: Webhooks;
   db: Db | null;
   accounts: AccountStore | null;
+  /** The server's GitHub source agent (null without a database). */
+  githubAgent: GitHubAgent | null;
+  /** Start the embedded zero-cache once the HTTP server listens on `port` (no-op with ZERO_CACHE_URL). */
+  startZero(port: number): void;
+  /** Node `upgrade` handler: WebSocket sync under /zero. Returns false for other paths. */
+  upgrade(req: IncomingMessage, socket: Duplex, head: Buffer): boolean;
   /** Resolves when the database is migrated (immediately without a database). */
   ready(): Promise<void>;
   close(): Promise<void>;
@@ -64,10 +74,10 @@ export function createServerApp(config: ServerConfig): ServerApp {
     absoluteTtlMs: config.sessionAbsoluteTtlMs,
   });
 
-  // Durable state: PostgreSQL (accounts, connected GitHub). Everything else is in memory.
+  // Durable state: PostgreSQL (accounts, connected GitHub, and every Zero-synced table).
   const signInConfigured = !!(config.oidc && config.databaseUrl && config.tokenEncryptionKey);
-  const db = signInConfigured ? connectDb(config.databaseUrl!, { schema: config.databaseSchema, max: config.databasePoolMax }) : null;
-  const accounts = db ? new AccountStore(db, new TokenBox(config.tokenEncryptionKey!)) : null;
+  const db = config.databaseUrl ? connectDb(config.databaseUrl, { schema: config.databaseSchema, max: config.databasePoolMax }) : null;
+  const accounts = db && signInConfigured ? new AccountStore(db, new TokenBox(config.tokenEncryptionKey!)) : null;
   const oidc = signInConfigured ? new Oidc({ ...config.oidc!, fetch: config.fetch }) : null;
   // Migrate at boot, retrying with back-off: a database outage must not crash-loop the server
   // (the health check never touches the database); sign-in waits for it instead.
@@ -216,6 +226,8 @@ export function createServerApp(config: ServerConfig): ServerApp {
   app.use("*", async (c, next) => {
     await next();
     authInst.commit(c);
+    const path = c.req.path;
+    if (path.startsWith("/auth/") || (c.res.headers.get("content-type") ?? "").includes("text/html")) authInst.commitBoot(c);
   });
   app.onError((err, c) => {
     const e = AppError.from(err);
@@ -224,6 +236,42 @@ export function createServerApp(config: ServerConfig): ServerApp {
   });
 
   app.get("/health", (c) => c.json({ ok: true, epoch: hub.epoch }));
+
+  // --- Zero sync: the web client's only data path ---
+  let githubAgent: GitHubAgent | null = null;
+  let zeroCache: ZeroCacheHandle | null = null;
+  const zeroTarget = () => config.zero?.cacheUrl ?? zeroCache?.url ?? null;
+  if (db && config.zero) {
+    githubAgent = new GitHubAgent({
+      db,
+      env,
+      registry,
+      githubToken: (accountId) =>
+        accounts
+          ? authInst.githubToken(accountId).catch((e) => {
+              log("warn", "GitHub token unavailable", { error: AppError.from(e).message });
+              return null;
+            })
+          : Promise.resolve(null),
+      appOrigin: config.appOrigin,
+      webhooks: !!config.webhookSecret,
+      log,
+    });
+    const agent = githubAgent;
+    void readyPromise.then(() => !closed && agent.start());
+    app.route(
+      "/",
+      createZeroRoutes({
+        config,
+        zero: config.zero,
+        db,
+        sessionAccount: (c) => authInst.readSession(c)?.accountId ?? null,
+        kick: () => agent.kick(),
+        log,
+      }),
+    );
+  }
+  app.all("/zero/*", zeroHttpProxy(zeroTarget));
 
   // --- auth ---
   app.use("/auth/*", csrfGuard(config.appOrigin));
@@ -318,9 +366,17 @@ export function createServerApp(config: ServerConfig): ServerApp {
     webhooks,
     db,
     accounts,
+    githubAgent,
+    startZero(port: number) {
+      if (!db || !config.zero || config.zero.cacheUrl || zeroCache) return;
+      zeroCache = startZeroCache({ zero: config.zero, serverPort: port, schema: config.databaseSchema, log });
+    },
+    upgrade: zeroUpgradeProxy(zeroTarget),
     ready: () => readyPromise,
     async close() {
       closed = true;
+      githubAgent?.close();
+      await zeroCache?.close();
       poll.close();
       rec.close();
       webhooks.close();

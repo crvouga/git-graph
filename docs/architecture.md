@@ -3,29 +3,53 @@
 Ports and adapters around one repository interface and one command registry.
 
 ```
-            ┌──────────────── browser ────────────────┐
- URL ⇄ ViewState (core/url)        UI (SolidJS)        │
-            │                       │  palette / keys / menus → registry (core/commands)
-            │                       ▼
-            │        Engine worker (web/engine/worker.ts)
-            │          fetch + JSON parse, GraphLayout, search index,
-            │          IndexedDB cache, SSE client, BroadcastChannel + Web Locks
-            │             │ HttpRepository            │ BrowserGitRepository (read-only .git)
-            └─────────────┼───────────────────────────┼──────────────┘
-                          ▼                           ▼ File System Access
-          ┌──────── hosted server (Hono) ────────┐   local folder
-          │ /api/v1  = core/api/router + registry │
-          │ GitHubAdapter (ETag cache, rate limit)│◀── webhooks (signed, deduped)
-          │ sessions, OAuth+PKCE, CSRF, CSP       │──▶ poller (reconcile, backoff)
-          │ EventHub → SSE                        │
-          └──────────────────────────────────────┘
-          ┌──────── companion (127.0.0.1:7420) ──┐
-          │ /api/v1  = same router + registry     │   git-graph CLI / MCP
-          │ CliGitAdapter → installed git         │◀── same registry, in-process
-          │ watchers (gitdir, common dir, tree)   │
-          │ bearer token, origin + host checks    │
-          └──────────────────────────────────────┘
+  ┌──────────── browser (SolidJS) ─────────────┐
+  │ URL ⇄ ViewState      UI: palette/keys/menus │      every read: a Zero query
+  │ Zero client (IndexedDB) ── queries ─────────┤      every write: a Zero mutator
+  │ graph worker: order + layout + search       │
+  │ browser agent: serves folders opened here   │──┐
+  └───────────────┬─────────────────────────────┘  │ mutators (agent.*)
+                  │ WebSocket /zero (same origin, session cookie)
+  ┌───────────────▼──── hosted server (Hono) ───────────────────────┐
+  │ /zero → zero-cache (child process) ⇄ /internal/zero/{query,mutate}│
+  │ PostgreSQL "lanes": repos, refs, commits, reads, operations,     │
+  │   demands, agents, visits (+ accounts, GitHub links)             │
+  │ GitHub agent: demands → GitHubAdapter → SQL; webhooks + poller   │
+  │ /api/v1, SSE, MCP over HTTP (unchanged, for agents and the CLI)  │
+  └───────────────▲──────────────────────────────────────────────────┘
+                  │ Zero client (token auth): queries for work, mutators to publish
+  ┌───────────────┴──── companion (git-graph serve) ─┐
+  │ CliGitAdapter → installed git, watchers           │   git-graph CLI / MCP (localhost API)
+  └───────────────────────────────────────────────────┘
 ```
+
+## Zero sync
+
+The web client has a single data path: [Zero](https://zero.rocicorp.dev). Everything it shows is a
+synced query (`src/zero/queries.ts`) answered from its local store at once and kept current by
+zero-cache; everything it changes is a mutator (`src/zero/mutators.ts`). There are no loading
+states: the UI renders what is synced, and more appears as it arrives.
+
+- **Repositories are published by source agents.** One generic `RepoSyncer` (`src/agent/`) turns
+  any `RepositoryPort` into rows: info and capabilities, refs, history pages, working-tree status.
+  The server runs it for GitHub (writing SQL directly), the companion runs it for local
+  repositories, and a browser tab runs it for folders it opened (both through Zero mutators).
+- **Demands** (`repo.open`): a viewer looking at a repository, with how much history. Agents serve
+  open demands, verify access first (GitHub: with the viewer's token), and stop serving idle ones.
+  The graph's window grows as the viewer scrolls (`repo.commits` with a larger limit, a deeper
+  demand).
+- **Reads** (`read.request`): commit details, diffs, files, blame, file history, worktrees,
+  conflicts, "my GitHub repositories". A read is a row: the agent fills in the result, everyone
+  who can see the repository shares it. Live reads (working tree) are re-run on change. The UI
+  prefetches details and diffs around the cursor, so opening them is immediate.
+- **Operations** (`op.enqueue`): every registry mutation (branch, tag, merge, push, stage…) is a
+  row run by the repository's agent with `executeCommand`, including the destructive
+  confirmation round trip (`confirm` state → the viewer accepts the exact consequence →
+  `op.confirm` with the token). GitHub operations run with the requester's own token.
+- **Permissions** are plain code: read rules in ZQL (`visibleRepos`: verified-public GitHub
+  repositories, or an access row), write rules in the server mutators (`src/server/zero/`).
+- **Order and layout** stay off the UI thread: the worker receives the synced commits as deltas
+  and computes git's date/topo order (`orderCommits`) and the lane layout for the query's tips.
 
 ## Core contracts (`src/core`)
 
@@ -56,16 +80,14 @@ only; one SVG draws edges for that window, grouped into one path per color.
 
 ## Synchronization
 
-| Source | Detection | Recovery |
+| Source | Detection | Published by |
 |---|---|---|
-| Local | `fs.watch` on worktree git dir, common dir (`refs`, `packed-refs`, `worktrees/`) and the working tree; 40–60 ms debounce; digest-based dedupe; every worktree of a common dir is notified | 5 s digest poll while subscribed |
-| GitHub | HMAC-verified webhooks, durable delivery-id dedupe, coalesced per repo, then authoritative ref re-read (order-independent) | adaptive ETag polling (304s are free), backoff when idle, pause without subscribers |
-| Browser | SSE (one tab per repo holds it via Web Locks; others get events over BroadcastChannel), focus/online/visibility triggers | 60 s safety poll when live, faster when polling; `resync` on epoch change |
+| GitHub | HMAC-verified webhooks, deduped; adaptive ETag polling of repositories with open demands | the server's GitHub agent, SQL |
+| Local | `fs.watch` on the git dirs and the working tree (40–60 ms debounce), digest dedupe | the companion, Zero mutators |
+| Browser folder | 60 s re-check while the tab is open | the tab, Zero mutators |
 
-The engine refreshes by reading refs (conditional request); if the version changed it fetches the first
-page, aligns it with loaded rows and splices (selection and scroll anchor kept by object id), otherwise
-it re-reads as many rows as were loaded. Each repository open is a session: requests of older sessions
-are aborted and their results dropped.
+Clients never poll: zero-cache pushes every change of a query's result. A refresh after a push
+re-reads refs, walks changed tips down to known commits and publishes only what is new.
 
 ## Security
 

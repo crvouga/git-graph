@@ -1,11 +1,12 @@
 // Diff of one file (commit, comparison or uncommitted), with hunk staging/unstaging/discarding,
 // and a conflict resolver for conflicted files. Escape returns focus to the file it came from.
 
-import { createEffect, createMemo, createResource, createSignal, For, Index, Match, onCleanup, onMount, Show, Switch } from "solid-js";
+import { createEffect, createMemo, createSignal, For, Index, Match, onCleanup, onMount, Show, Switch } from "solid-js";
 import { AppError, type CommitDetails, type ConflictFile, type Diff, type FileDiff, type Hunk } from "../../core/types.ts";
 import { WORKING } from "../../core/url/state.ts";
 import { app } from "../app/store.ts";
-import { invokeMutation, portCall } from "../app/commands.ts";
+import { invokeMutation } from "../app/commands.ts";
+import { requestRead, useRead } from "../app/sync.ts";
 import { isReviewed, setReviewed } from "./Details.tsx";
 import { IconClose, IconDown, IconUp } from "./icons.tsx";
 
@@ -40,41 +41,51 @@ export function DiffView() {
     return ra > rb ? { base: a, head: b } : { base: b, head: a };
   });
 
-  const [sections] = createResource(
-    () => (conflicted() || !app.readySession() ? null : `${app.readySession()}|${v().commit}|${v().compare}|${v().file}|${isWorking() ? JSON.stringify(app.repo.status) : ""}`),
-    async (): Promise<Section[]> => {
-      const p = path();
-      if (isWorking()) {
-        const [staged, unstaged] = await Promise.all([
-          portCall<Diff>("diff", [{ kind: "working", staged: true }, { path: p }]),
-          portCall<Diff>("diff", [{ kind: "working", staged: false }, { path: p }]),
-        ]);
-        const out: Section[] = [];
-        if (staged.files[0]) out.push({ title: "Staged changes", staged: true, file: staged.files[0] });
-        if (unstaged.files[0]) out.push({ title: "Unstaged changes", staged: false, file: unstaged.files[0] });
-        return out.length ? out : [{ title: null, staged: null, file: null }];
-      }
-      const pr = pair();
-      const full = app.rows.commits[app.rows.index.get(v().commit!) ?? -1]?.hash ?? v().commit!;
-      const d = pr ? await portCall<Diff>("diff", [{ kind: "compare", base: pr.base, head: pr.head }, { path: p }]) : await portCall<Diff>("diff", [{ kind: "commit", hash: full }, { path: p }]);
-      return [{ title: null, staged: null, file: d.files.find((f) => f.path === p || f.oldPath === p) ?? d.files[0] ?? null }];
+  // Diffs are reads through Zero. A commit's (or comparison's) whole diff is one shared read, so
+  // every file of it opens at once; the working tree is read per file and re-read on change.
+  const full = () => app.rows.commits[app.rows.index.get(v().commit!) ?? -1]?.hash ?? v().commit!;
+  const spec = (method: "diff" | "commit", params: unknown[], live = false) => {
+    const id = app.repoId();
+    return id ? { repoId: id, method, params, live } : null;
+  };
+  const stagedRead = useRead<Diff>(() => (isWorking() && !conflicted() ? spec("diff", [{ kind: "working", staged: true }, { path: path() }], true) : null));
+  const unstagedRead = useRead<Diff>(() => (isWorking() && !conflicted() ? spec("diff", [{ kind: "working", staged: false }, { path: path() }], true) : null));
+  const wholeRead = useRead<Diff>(() => {
+    if (isWorking() || conflicted() || !v().commit) return null;
+    const pr = pair();
+    return spec("diff", [pr ? { kind: "compare", base: pr.base, head: pr.head } : { kind: "commit", hash: full() }]);
+  });
+  const detailsRead = useRead<CommitDetails>(() => (!isWorking() && !pair() && v().commit ? spec("commit", [full()]) : null));
+
+  const sectionsValue = createMemo<Section[] | undefined>(() => {
+    const p = path();
+    if (isWorking()) {
+      const staged = stagedRead.value();
+      const unstaged = unstagedRead.value();
+      if (!staged && !unstaged) return undefined;
+      const out: Section[] = [];
+      if (staged?.files[0]) out.push({ title: "Staged changes", staged: true, file: staged.files[0] });
+      if (unstaged?.files[0]) out.push({ title: "Unstaged changes", staged: false, file: unstaged.files[0] });
+      return out.length ? out : [{ title: null, staged: null, file: null }];
+    }
+    const d = wholeRead.value();
+    if (!d) return undefined;
+    return [{ title: null, staged: null, file: d.files.find((f) => f.path === p || f.oldPath === p) ?? null }];
+  });
+  const sections = Object.assign(sectionsValue, {
+    get error() {
+      return (isWorking() ? (stagedRead.error() ?? unstagedRead.error()) : wholeRead.error()) ?? undefined;
     },
-  );
+  });
 
   // Sibling files for ]/[ navigation.
-  const [siblings] = createResource(
-    () => (app.readySession() ? `${app.readySession()}|${v().commit}|${v().compare}|${isWorking() ? JSON.stringify(app.repo.status) : ""}` : null),
-    async (): Promise<string[]> => {
-      if (isWorking()) {
-        const s = app.repo.status;
-        return s ? [...s.conflicted, ...s.staged, ...s.unstaged].map((f) => f.path).concat(s.untracked).filter((x, i, a) => a.indexOf(x) === i) : [];
-      }
-      const pr = pair();
-      if (pr) return (await portCall<Diff>("diff", [{ kind: "compare", base: pr.base, head: pr.head }])).files.map((f) => f.path);
-      const full = app.rows.commits[app.rows.index.get(v().commit!) ?? -1]?.hash ?? v().commit!;
-      return (await portCall<CommitDetails>("commit", [full])).files.map((f) => f.path);
-    },
-  );
+  const siblings = createMemo<string[]>(() => {
+    if (isWorking()) {
+      const s = app.repo.status;
+      return s ? [...s.conflicted, ...s.staged, ...s.unstaged].map((f) => f.path).concat(s.untracked).filter((x, i, a) => a.indexOf(x) === i) : [];
+    }
+    return (wholeRead.value()?.files ?? detailsRead.value()?.files ?? []).map((f) => f.path);
+  });
 
   const hunks = createMemo(() => {
     const out: { si: number; hi: number; sec: Section; h: Hunk }[] = [];
@@ -225,10 +236,8 @@ export function DiffView() {
         </div>
       </Show>
       <Show when={!conflicted()}>
-        <Show when={sections.state === "ready" || sections.state === "errored"} fallback={<div class="p-4 text-muted">Loading diff…</div>}>
-          <Show when={!sections.error} fallback={<div class="text-del p-4">{AppError.from(sections.error).message}</div>}>
-            <VirtualDiff items={items()} focusHunk={focusHunk()} onHunk={(gi, kind) => (setFocusHunk(gi), hunkAction(gi, kind))} ref={(el) => (scroller = el)} />
-          </Show>
+        <Show when={!sections.error} fallback={<div class="text-del p-4">{AppError.from(sections.error).message}</div>}>
+          <VirtualDiff items={items()} focusHunk={focusHunk()} onHunk={(gi, kind) => (setFocusHunk(gi), hunkAction(gi, kind))} ref={(el) => (scroller = el)} />
         </Show>
       </Show>
     </div>
@@ -236,10 +245,13 @@ export function DiffView() {
 }
 
 function ConflictView(p: { path: string }) {
-  const [data, { refetch }] = createResource(
-    () => (app.readySession() ? `${app.readySession()}|${p.path}` : null),
-    () => portCall<ConflictFile>("conflict", [p.path]),
-  );
+  const conflict = useRead<ConflictFile>(() => (app.repoId() ? { repoId: app.repoId()!, method: "conflict", params: [p.path], live: true } : null));
+  const data = Object.assign(() => conflict.value(), {
+    get error() {
+      return conflict.error();
+    },
+  });
+  const refetch = () => app.repoId() && requestRead({ repoId: app.repoId()!, method: "conflict", params: [p.path], live: true });
   const [text, setText] = createSignal("");
   createEffect(() => {
     const d = data();
@@ -249,7 +261,7 @@ function ConflictView(p: { path: string }) {
     void invokeMutation("git.conflict.resolve", { commit: null, ref: null, file: { path: p.path, area: "conflicted" }, hunk: null, worktree: null }, { path: p.path, resolution }).then(() => refetch());
   return (
     <div class="flex h-full flex-col gap-2 p-3">
-      <Show when={data()} fallback={<div class="text-muted">{data.error ? AppError.from(data.error).message : "Loading conflict…"}</div>}>
+      <Show when={data()} fallback={<Show when={data.error}>{(e) => <div class="text-del">{AppError.from(e()).message}</div>}</Show>}>
         {(d) => (
           <>
             <div class="flex flex-wrap items-center gap-2">

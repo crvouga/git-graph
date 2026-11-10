@@ -28,10 +28,10 @@ export function ControlBar() {
     const s = sync();
     if (!s) return { dot: "var(--fg-muted)", label: "Not connected", detail: "" };
     const when = `Last synchronized ${ago(s.lastSuccessAt)}`;
-    if (s.connection === "offline") return { dot: "var(--del)", label: "Offline — showing cached data", detail: `${when}${s.lastError ? `\nLast error: ${s.lastError}` : ""}` };
+    if (s.connection === "offline" || s.connection === "connecting") return { dot: "var(--del)", label: "Offline — showing synced data", detail: `${when}${s.lastError ? `\nLast error: ${s.lastError}` : ""}` };
     if (s.lastError) return { dot: "var(--warn)", label: "Sync problem", detail: `${s.lastError}\n${when}` };
     if (s.stale || s.fromCache) return { dot: "var(--warn)", label: s.fromCache ? "Cached — checking for changes" : "Checking for changes", detail: when };
-    if (s.connection === "live") return { dot: "var(--add)", label: `Live${s.leader ? "" : " (shared with another tab)"}`, detail: when };
+    if (s.connection === "live") return { dot: "var(--add)", label: "Live", detail: when };
     return { dot: "var(--focus)", label: "Polling for changes", detail: when };
   });
   return (
@@ -87,8 +87,8 @@ export function ControlBar() {
             <IconRefresh />
           </button>
         </Show>
-        <Show when={app.companion().token}>
-          <span class="icon-btn" title={`Local companion paired (${app.companion().baseUrl})`} aria-label="Local companion paired">
+        <Show when={app.companions().some((c) => c.online)}>
+          <span class="icon-btn" title={`Companion online: ${app.companions().filter((c) => c.online).map((c) => c.name).join(", ")}`} aria-label="Local companion online">
             <IconPlug />
           </span>
         </Show>

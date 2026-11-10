@@ -1,15 +1,33 @@
 // Application controller. The URL (ViewState) is the source of truth for shareable navigation;
-// everything else here is ephemeral UI state or data pushed by the engine worker.
+// repository data comes from Zero (src/web/app/zero.ts); the engine worker turns it into rows.
 
-import { batch, createMemo, createRoot, createSignal } from "solid-js";
+import { batch, createComputed, createMemo, createRoot, createSignal, on, onCleanup } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
-import { AppError, repoKey, type Capabilities, type HistoryQuery, type Ref, type RefsSnapshot, type RepoInfo, type RepoRef, type WorkingTreeStatus } from "../../core/types.ts";
+import { AppError, parseRepoKey, repoKey, type Capabilities, type Commit, type HistoryQuery, type Ref, type RefsSnapshot, type RepoInfo, type RepoRef, type WorkingTreeStatus } from "../../core/types.ts";
 import { EMPTY_VIEW, parseUrl, serialize, shouldPush, WORKING, type ViewState } from "../../core/url/state.ts";
+import { mutators } from "../../zero/mutators.ts";
+import { queries } from "../../zero/queries.ts";
+import { rowToCommit, snapshotOf, type CommitRow, type RefRow } from "../../zero/rows.ts";
+import type { RepoSync } from "../../zero/schema.ts";
 import { Engine, GraphRows } from "../engine/client.ts";
-import type { EngineEvent, SourceConfig, SyncInfo } from "../engine/protocol.ts";
-import { loadHandle } from "./handles.ts";
+import type { EngineEvent, SyncInfo } from "../engine/protocol.ts";
 import { address } from "./address.ts";
 import { IN_STORYBOOK } from "./env.ts";
+import { requestRead, serveBrowserRepo } from "./sync.ts";
+import { boot, connection, live, mutate, zero } from "./zero.ts";
+
+/** A repository as Zero syncs it (src/zero/schema.ts). */
+interface RepoRow {
+  id: string;
+  info?: RepoInfo | null;
+  caps?: Capabilities | null;
+  head: import("../../core/types.ts").HeadState;
+  refs_version: string;
+  status?: WorkingTreeStatus | null;
+  commit_count: number;
+  history_complete: boolean;
+  sync: RepoSync;
+}
 
 /** Signed in through the auth relay (Google). */
 export interface AuthUser {
@@ -31,8 +49,8 @@ export interface AuthState {
 }
 
 // ---------------------------------------------------------------------------
-// Persistence helpers (localStorage is only used for per-user preferences, never credentials
-// for GitHub; the companion bearer token is a localhost-only secret stored per origin).
+// Persistence helpers: localStorage holds per-device preferences only (columns, theme, and the
+// recent list of signed-out visitors). Everything else is synced by Zero.
 // ---------------------------------------------------------------------------
 
 function load<T>(key: string, dflt: T): T {
@@ -61,11 +79,6 @@ export interface Columns {
   showDate: boolean;
   showAuthor: boolean;
   showHash: boolean;
-}
-
-export interface CompanionConfig {
-  baseUrl: string;
-  token: string | null;
 }
 
 export interface RecentRepo {
@@ -153,24 +166,22 @@ function createApp() {
     refs: RefsSnapshot | null;
     status: WorkingTreeStatus | null;
     sync: SyncInfo | null;
-    error: { code: string; message: string } | null;
-    loading: boolean;
+    error: { code: string; message: string; details?: Record<string, unknown> } | null;
     missingRefs: string[];
-  }>({ info: null, caps: null, refs: null, status: null, sync: null, error: null, loading: false, missingRefs: [] });
+  }>({ info: null, caps: null, refs: null, status: null, sync: null, error: null, missingRefs: [] });
 
   const [auth, setAuth] = createStore<AuthState>({
-    checked: false,
-    serverAvailable: false,
-    authenticated: false,
+    checked: true,
+    serverAvailable: boot.server,
+    authenticated: !!boot.accountId,
     user: null,
     github: null,
-    loginEnabled: false,
-    githubEnabled: false,
+    loginEnabled: boot.loginEnabled,
+    githubEnabled: boot.githubEnabled,
   });
 
-  const [companion, setCompanionSignal] = createSignal<CompanionConfig>(load("lanes.companion", { baseUrl: "http://127.0.0.1:7420", token: null }));
   const [columns, setColumnsSignal] = createSignal<Columns>(load("lanes.columns.v2", DEFAULT_COLUMNS));
-  const [recents, setRecents] = createSignal<RecentRepo[]>(load("lanes.recents", []));
+  const [localRecents, setLocalRecents] = createSignal<RecentRepo[]>(load("lanes.recents", []));
   const [theme, setThemeSignal] = createSignal<"system" | "light" | "dark">(load("lanes.themePref", "system"));
 
   // Keyboard cursor (row index), focused ref within the row, and transient overlays.
@@ -183,6 +194,7 @@ function createApp() {
   const [helpOpen, setHelpOpen] = createSignal(false);
   const [tooltip, setTooltip] = createSignal<{ x: number; y: number; row: number } | null>(null);
   const [toasts, setToasts] = createStore<Toast[]>([]);
+  /** A queued operation the user is waiting on (shown as plain text, never as a spinner). */
   const [busy, setBusy] = createSignal<string | null>(null);
   const [metrics, setMetrics] = createStore<Record<string, number>>({});
   (globalThis as { __lanesMetrics?: Record<string, number> }).__lanesMetrics = metrics;
@@ -192,6 +204,41 @@ function createApp() {
   let session = 0;
   const [sessionSig, setSessionSig] = createSignal(0);
   let toastId = 0;
+  // Declared up front: Zero can deliver local rows synchronously while the computeds below are set up.
+  const waiters = new Set<{ hash: string; resolve: (r: number) => void }>();
+  const initialTarget = { done: false, session: -1 };
+  let scrollEl: HTMLElement | null = null;
+  const lastVisit = new Map<string, number>();
+  let findSeq = 0;
+  let findJump = false;
+
+  // ------------------------------------------------------------------ account (Zero)
+
+  const account = live<{ id: string; name?: string | null; email?: string | null; picture?: string | null; github?: { github_login: string; github_name?: string | null; github_avatar_url?: string | null } | null }>(() =>
+    boot.accountId ? queries.me.account({}) : null,
+  );
+  createComputed(() => {
+    const a = account.data();
+    if (!boot.accountId || !a) return;
+    setAuth({
+      user: { name: a.name ?? null, email: a.email ?? null, avatarUrl: a.picture ?? null },
+      github: a.github ? { connected: true, login: a.github.github_login, name: a.github.github_name ?? null, avatarUrl: a.github.github_avatar_url ?? null } : { connected: false },
+    });
+  });
+
+  const visits = live<{ repo_id: string; name: string; path?: string | null; visited_at: number }[]>(() => (boot.accountId ? queries.me.visits({}) : null));
+  const recents = createMemo<RecentRepo[]>(() => {
+    const v = visits.data();
+    if (!boot.accountId || !v) return localRecents();
+    return v.map((r) => ({ key: r.repo_id, name: r.name, ...(r.path ? { path: r.path } : {}), at: r.visited_at }));
+  });
+
+  const agentsQ = live<{ id: string; kind: string; name: string; last_seen_at?: number | null }[]>(() => (boot.accountId ? queries.me.agents({}) : null));
+  /** This account's companions; `online` when one checked in recently. */
+  const companions = createMemo(() => {
+    const now = Date.now();
+    return (agentsQ.data() ?? []).filter((a) => a.kind === "companion").map((a) => ({ id: a.id, name: a.name, online: !!a.last_seen_at && now - a.last_seen_at < 3 * 60_000 }));
+  });
 
   // ------------------------------------------------------------------ derived
 
@@ -264,16 +311,8 @@ function createApp() {
 
   function applyView(next: ViewState, prev: ViewState) {
     setViewSignal(next);
-    const repoChanged = (prev.repo ? repoKey(prev.repo) : null) !== (next.repo ? repoKey(next.repo) : null);
-    const queryChanged =
-      prev.branches.join("\n") !== next.branches.join("\n") ||
-      prev.display.remotes !== next.display.remotes ||
-      prev.display.tags !== next.display.tags ||
-      prev.display.stashes !== next.display.stashes ||
-      prev.display.order !== next.display.order ||
-      prev.display.firstParent !== next.display.firstParent;
-    if (repoChanged || queryChanged || prev.worktree !== next.worktree) void openRepo(next);
-    else if (next.commit && next.commit !== prev.commit) void revealCommit(next.commit);
+    const sameRepo = (prev.repo ? repoKey(prev.repo) : null) === (next.repo ? repoKey(next.repo) : null);
+    if (sameRepo && next.commit && next.commit !== prev.commit) void revealCommit(next.commit);
     document.title = next.repo ? `${repoLabelOf(next.repo)} · Lanes` : "Lanes";
   }
 
@@ -289,7 +328,155 @@ function createApp() {
     return recents().find((x) => x.key === repoKey(r))?.name ?? r.id;
   }
 
-  // ------------------------------------------------------------------ repository sessions
+  // ------------------------------------------------------------------ the open repository (Zero)
+  //
+  // Opening a repository is a demand ("I am looking at this, with this much history"); the
+  // repository's agent publishes it and Zero syncs it here. The graph is computed from whatever
+  // part of it is already in the local store, and updates as more arrives.
+
+  const INITIAL_WINDOW = 1500;
+  const GROW = 2000;
+  const repoId = createMemo(() => {
+    const r = view().repo;
+    return r ? repoKey(r) : null;
+  });
+  const [win, setWin] = createSignal(INITIAL_WINDOW);
+  /** The browser-folder agent registered the repository (browser repos open after that). */
+  const [served, setServed] = createSignal<string | null>(null);
+  /** Commits this session has handed to the worker. */
+  const sent = new Map<string, true>();
+  /** Commit details already requested for prefetch. */
+  const prefetched = new Set<string>();
+  let refsDigest = "";
+
+  const repoRow = live<RepoRow>(() => (repoId() ? queries.repo.byId({ repoId: repoId()! }) : null));
+  const refRows = live<RefRow[]>(() => (repoId() ? queries.repo.refs({ repoId: repoId()! }) : null));
+  const demand = live<{ state: string; error?: { code: string; message: string; details?: Record<string, unknown> } | null }>(() => (repoId() ? queries.repo.demand({ repoId: repoId()! }) : null));
+  const commitRows = live<CommitRow[]>(() => (repoId() ? queries.repo.commits({ repoId: repoId()!, limit: win() }) : null));
+
+  /** Tell the repository's agent we are looking (and how deep); repeated while we look. */
+  function openDemand(id: string) {
+    mutate(mutators.repo.open({ repoId: id, depth: win() + 500, now: Date.now() }));
+  }
+
+  createComputed(
+    on(repoId, (id) => {
+      const mySession = ++session;
+      setWin(INITIAL_WINDOW);
+      setServed(null);
+      sent.clear();
+      refsDigest = "";
+      batch(() => {
+        rows.apply({ t: "rows", session: mySession, kind: "reset", commits: [], layout: { from: 0, nodeLane: new Int16Array(0), nodeColor: new Int16Array(0), edgeStart: new Uint32Array(1), edges: new Int16Array(0), tail: new Int16Array(0), width: 0 }, complete: false, stale: true, refs: { head: { kind: "none" }, refs: [], version: "" } });
+        setRowsVersion((x) => x + 1);
+        setRepo(reconcile({ info: null, caps: null, refs: null, status: null, sync: null, error: null, missingRefs: [] }));
+        setFind({ open: find.open, text: find.text, matches: [], current: -1 });
+        setKbRow(0);
+        setRefCursor(-1);
+      });
+      void engine.call({ method: "reset", args: { session: mySession } }).catch(() => {});
+      setSessionSig(mySession);
+      if (!id) return;
+      const ref = parseRepoKey(id);
+      if (ref?.provider === "local" && !boot.accountId) {
+        setRepo("error", { code: "UNAUTHENTICATED", message: "Local repositories are synced to your account by the git-graph companion. Sign in first." });
+        return;
+      }
+      if (ref?.provider === "browser") {
+        void serveBrowserRepo(id).then(
+          (here) => {
+            if (session !== mySession) return;
+            setServed(id);
+            openDemand(id);
+            // Opened in another browser: what it synced is shown; without that there is nothing.
+            if (!here && !repoRow.data()) setRepo("error", { code: "NOT_FOUND", message: "This browser does not have that folder. Use “Open folder…” to pick it again, or open it from the browser that has it." });
+          },
+          (e) => {
+            if (session !== mySession) return;
+            const err = AppError.from(e);
+            setRepo("error", { code: err.code, message: err.message, ...(err.details ? { details: err.details } : {}) });
+          },
+        );
+      } else openDemand(id);
+      const keepAlive = setInterval(() => session === mySession && repoId() && openDemand(id), 4 * 60_000);
+      onCleanup(() => clearInterval(keepAlive));
+    }),
+  );
+
+  // Commits → worker, as deltas against what this session already sent.
+  createComputed(() => {
+    const list = commitRows.data();
+    const id = repoId();
+    if (!list || !id) return;
+    const add: Commit[] = [];
+    const seen = new Set<string>();
+    for (const r of list) {
+      if (r.repo_id !== id) continue;
+      seen.add(r.hash);
+      if (!sent.has(r.hash)) {
+        sent.set(r.hash, true);
+        add.push(rowToCommit(r));
+      }
+    }
+    const remove: string[] = [];
+    for (const h of sent.keys()) if (!seen.has(h)) remove.push(h);
+    for (const h of remove) sent.delete(h);
+    if (add.length || remove.length) void engine.call({ method: "commits", args: { session, add, remove } }).catch(() => {});
+  });
+
+  // Repository row, refs and the view's query → store and worker.
+  createComputed(() => {
+    const r = repoRow.data();
+    const id = repoId();
+    const refList = refRows.data();
+    if (!id || !r || r.id !== id) return;
+    if (repo.error?.code === "NOT_FOUND") setRepo("error", null);
+    const snap = snapshotOf(r.head, r.refs_version, (refList ?? []).filter((x) => x.repo_id === id));
+    const synced = commitRows.data()?.length ?? 0;
+    const complete = r.history_complete && synced >= r.commit_count;
+    const v = view();
+    batch(() => {
+      setRepo({ info: r.info ?? null, caps: r.caps ?? null, status: r.status ?? null });
+      // Refs rows can arrive after the repository row with the same version: compare content.
+      const digest = `${snap.version}|${JSON.stringify(snap.head)}|${snap.refs.map((x) => `${x.name}=${x.commit}`).join(",")}`;
+      if (digest !== refsDigest) {
+        refsDigest = digest;
+        setRepo("refs", snap);
+      }
+    });
+    void engine
+      .call({ method: "state", args: { session, state: { refs: snap, query: queryFor(v), status: r.status ?? null, complete } } })
+      .catch(() => {});
+    if (r.info) rememberRecent({ key: id, name: r.info.name, ...(r.info.worktreePath ? { path: r.info.worktreePath } : {}), at: Date.now() });
+  });
+
+  // Why a repository cannot be shown (the viewer's demand failed).
+  createComputed(() => {
+    const d = demand.data();
+    const ref = repoId() ? parseRepoKey(repoId()!) : null;
+    if (ref?.provider === "browser" && served() !== repoId() && repo.error) return;
+    if (d?.state === "error" && d.error) setRepo("error", d.error);
+    else if (repo.error && d?.state === "ok") setRepo("error", null);
+  });
+
+  // Freshness: the agent's report plus our own connection to the server.
+  createComputed(() => {
+    const r = repoRow.data();
+    const c = connection();
+    if (!repoId()) return;
+    const s = r?.sync ?? {};
+    const offline = c.name !== "connected";
+    setRepo("sync", {
+      connection: offline ? (c.name === "connecting" ? "connecting" : "offline") : (s.state ?? "polling"),
+      lastSuccessAt: s.lastSuccessAt ?? null,
+      lastError: s.lastError ?? null,
+      stale: offline || !!s.lastError,
+      fromCache: offline,
+      refsVersion: r?.refs_version ?? null,
+      pending: 0,
+      leader: true,
+    });
+  });
 
   function queryFor(v: ViewState): HistoryQuery {
     return {
@@ -302,63 +489,45 @@ function createApp() {
     };
   }
 
-  async function sourceFor(r: RepoRef): Promise<SourceConfig> {
-    if (r.provider === "github") return { kind: "server", baseUrl: `${location.origin}/api/v1` };
-    if (r.provider === "local") {
-      const c = companion();
-      if (!c.token) throw new AppError("UNAUTHENTICATED", "This is a local repository. Connect the git-graph companion first (run `git-graph open .` in the repository, or use “Connect local companion…”).");
-      return { kind: "companion", baseUrl: `${c.baseUrl}/api/v1`, token: c.token };
-    }
-    const handle = await loadHandle(r.id);
-    if (!handle) throw new AppError("NOT_FOUND", "This browser no longer has access to that folder. Use “Open folder…” to pick it again.");
-    const perm = await (handle as FileSystemDirectoryHandle & { queryPermission?: (o: object) => Promise<string> }).queryPermission?.({ mode: "read" });
-    if (perm && perm !== "granted") throw new AppError("FORBIDDEN", "The browser needs your permission to read this folder again.", { reauthorize: r.id });
-    return { kind: "fs", handle };
-  }
-
-  async function openRepo(v: ViewState) {
-    const mySession = ++session;
-    const r = v.repo;
-    batch(() => {
-      rows.apply({ t: "rows", session: mySession, kind: "reset", commits: [], layout: { from: 0, nodeLane: new Int16Array(0), nodeColor: new Int16Array(0), edgeStart: new Uint32Array(1), edges: new Int16Array(0), tail: new Int16Array(0), width: 0 }, complete: false, stale: true, refs: { head: { kind: "none" }, refs: [], version: "" } });
-      setRowsVersion((x) => x + 1);
-      setRepo(reconcile({ info: null, caps: null, refs: null, status: null, sync: null, error: null, loading: !!r, missingRefs: [] }));
-      setFind({ open: find.open, text: find.text, matches: [], current: -1 });
-      setKbRow(0);
-      setRefCursor(-1);
-    });
-    if (!r) {
-      void engine.call({ method: "close", args: { session: mySession - 1 } }).catch(() => {});
+  /** More history: widen the synced window (and the agent's depth). */
+  function growWindow() {
+    const r = repoRow.data();
+    if (!r || !repoId()) return;
+    const synced = commitRows.data()?.length ?? 0;
+    if (synced < win()) {
+      // The agent has not published that far yet: ask it to.
+      if (!r.history_complete) openDemand(repoId()!);
       return;
     }
-    const key = repoKey(r);
-    try {
-      const source = await sourceFor(r);
-      if (mySession !== session) return;
-      const res = await engine.call<{ row: number }>({
-        method: "open",
-        args: { session: mySession, repoKey: key, source, query: queryFor(v), initial: 300, ensure: v.at ?? (v.commit && v.commit !== WORKING ? v.commit : v.commit) ?? null },
-      });
-      if (mySession !== session) return;
-      setRepo("loading", false);
-      setSessionSig(mySession);
-      const target = v.at ?? v.commit;
-      if (target) {
-        if (res.row >= 0) {
-          setKbRow(res.row);
-          requestAnimationFrame(() => scrollToRow(res.row, v.at ? "top" : "center"));
-        } else if (v.commit) {
-          toast("error", `Commit ${v.commit.slice(0, 10)} was not found`, "It may have been rewritten or deleted, or it is not reachable from the branches shown. Try “Show All” branches.");
+    setWin((w) => Math.min(w + GROW, 50_000));
+    openDemand(repoId()!);
+  }
+
+  /** Row of `hash`, widening the window until it appears (or history ends). */
+  function ensureRow(hash: string, maxWindow = 50_000): Promise<number> {
+    const find = () => rows.index.get(hash) ?? (hash.length < 40 ? findPrefix(hash) : -1);
+    const now = find();
+    if (now >= 0 || hash === WORKING) return Promise.resolve(now);
+    return new Promise((resolve) => {
+      const w = { hash, resolve };
+      waiters.add(w);
+      const step = () => {
+        if (!waiters.has(w)) return;
+        const r = repoRow.data();
+        const synced = commitRows.data()?.length ?? 0;
+        const done = !!r && r.history_complete && synced >= r.commit_count;
+        if (done || win() >= maxWindow) {
+          waiters.delete(w);
+          return resolve(find());
         }
-      }
-      const info = repo.info;
-      if (info) rememberRecent({ key, name: info.name, path: info.worktreePath, at: Date.now() });
-    } catch (e) {
-      if (mySession !== session) return;
-      const err = AppError.from(e);
-      if (err.code === "CANCELLED") return;
-      setRepo({ loading: false, error: { code: err.code, message: err.message } });
-    }
+        growWindow();
+        setTimeout(step, 400);
+      };
+      setTimeout(step, 50);
+      setTimeout(() => {
+        if (waiters.delete(w)) resolve(find());
+      }, 30_000);
+    });
   }
 
   engine.on((ev: EngineEvent) => {
@@ -367,57 +536,72 @@ function createApp() {
       case "rows": {
         const anchor = captureAnchor();
         rows.apply(ev);
-        if (ev.kind !== "append") {
-          setRepo("refs", ev.refs);
-          checkMissingRefs(ev.refs);
-        }
         setRowsVersion((x) => x + 1);
-        if (ev.kind !== "append") restoreAnchor(anchor);
+        if (ev.kind !== "append") {
+          checkMissingRefs(ev.refs);
+          restoreAnchor(anchor);
+        }
         if (find.open && find.text) void runFind(find.text, true);
+        for (const w of [...waiters]) {
+          const r = rows.index.get(w.hash) ?? (w.hash.length < 40 ? findPrefix(w.hash) : -1);
+          if (r >= 0) {
+            waiters.delete(w);
+            w.resolve(r);
+          }
+        }
+        if (!initialTarget.done) revealInitial();
         break;
       }
-      case "repo":
-        setRepo({ info: ev.info, caps: ev.caps });
-        break;
-      case "status":
-        setRepo("status", ev.status);
-        break;
-      case "sync":
-        setRepo("sync", ev.sync);
-        break;
-      case "error":
-        if (ev.error.code === "UNAUTHENTICATED" || ev.error.code === "FORBIDDEN" || ev.error.code === "NOT_FOUND") {
-          setRepo("error", ev.error);
-          if (ev.error.code === "UNAUTHENTICATED") void checkSession();
-        } else toast("error", ev.error.message);
-        break;
       case "metric": {
         setMetrics(ev.name, Math.round(ev.value * 10) / 10);
-        const log = ((globalThis as { __lanesEvents?: unknown[] }).__lanesEvents ??= []);
-        log.push({ at: Date.now(), metric: ev.name, value: Math.round(ev.value) });
-        if (log.length > 100) log.shift();
-        break;
-      }
-      case "event": {
-        // Recent repository events, for diagnostics and automated tests.
-        const log = ((globalThis as { __lanesEvents?: unknown[] }).__lanesEvents ??= []);
-        log.push({ at: Date.now(), ...ev.event });
-        if (log.length > 100) log.shift();
         break;
       }
     }
   });
 
+  /** A deep link to a commit (or ?at=) is revealed once, as soon as its row exists. */
+  function revealInitial() {
+    if (initialTarget.session !== session) {
+      initialTarget.session = session;
+      initialTarget.done = false;
+    }
+    const v = view();
+    const target = v.at ?? v.commit;
+    if (!target || target === WORKING) {
+      initialTarget.done = true;
+      return;
+    }
+    const r = rows.index.get(target) ?? findPrefix(target);
+    if (r >= 0) {
+      initialTarget.done = true;
+      setKbRow(r);
+      requestAnimationFrame(() => scrollToRow(r, v.at ? "top" : "center"));
+      return;
+    }
+    if (rows.length) {
+      initialTarget.done = true;
+      void ensureRow(target).then((row) => {
+        if (row >= 0) {
+          setKbRow(row);
+          requestAnimationFrame(() => scrollToRow(row, v.at ? "top" : "center"));
+        } else if (v.commit) {
+          toast("error", `Commit ${v.commit.slice(0, 10)} was not found`, "It may have been rewritten or deleted, or it is not reachable from the branches shown. Try “Show All” branches.");
+        }
+      });
+    }
+  }
+
   function checkMissingRefs(snap: RefsSnapshot) {
+    if (!snap.version) return;
     const v = view();
     const names = new Set<string>();
     for (const r of snap.refs) {
       names.add(r.short);
       names.add(r.name);
     }
-    const missing = v.branches.filter((b) => !names.has(b));
+    const missing = v.branches.filter((b) => !names.has(b) && !/^[0-9a-f]{40,64}$/i.test(b));
+    if (v.focusBranch && !names.has(v.focusBranch)) missing.push(v.focusBranch);
     setRepo("missingRefs", missing);
-    if (v.focusBranch && !names.has(v.focusBranch)) setRepo("missingRefs", [...missing, v.focusBranch]);
   }
 
   /** Keep the same commit at the same screen position across refreshes (selection by object id). */
@@ -443,9 +627,24 @@ function createApp() {
     }
   }
 
-  // ------------------------------------------------------------------ geometry & scrolling
+  // Prefetch the details of commits around the cursor, so opening them shows everything at once.
+  createComputed(
+    on([kbRow, rowsVersion], () => {
+      const id = repoId();
+      if (!id || !rows.length) return;
+      const r0 = kbRow();
+      for (let r = Math.max(0, r0 - 2); r <= Math.min(rows.length - 1, r0 + 3); r++) {
+        const c = rows.commits[r]!;
+        if (c.hash !== WORKING && !prefetched.has(`${id}|${c.hash}`)) {
+          prefetched.add(`${id}|${c.hash}`);
+          requestRead({ repoId: id, method: "commit", params: [c.hash] });
+        }
+      }
+    }),
+  );
 
-  let scrollEl: HTMLElement | null = null;
+// ------------------------------------------------------------------ geometry & scrolling
+
   function setScrollEl(el: HTMLElement | null) {
     scrollEl = el;
   }
@@ -488,9 +687,7 @@ function createApp() {
 
   async function revealCommit(hash: string) {
     let r = rows.index.get(hash) ?? findPrefix(hash);
-    if (r < 0 && hash !== WORKING) {
-      r = await engine.call<number>({ method: "ensure", args: { session, hash } }).catch(() => -1);
-    }
+    if (r < 0 && hash !== WORKING) r = await ensureRow(hash);
     if (r >= 0) {
       setKbRow(r);
       requestAnimationFrame(() => scrollToRow(r, "center"));
@@ -606,7 +803,7 @@ function createApp() {
   }
 
   function maybeLoadMore(r: number) {
-    if (!rows.complete && r > rows.length - 400) void engine.call({ method: "loadMore", args: { session, count: 1000 } }).catch(() => {});
+    if (!rows.complete && r > rows.length - 400) growWindow();
   }
 
   function jumpTo(r: number) {
@@ -627,7 +824,7 @@ function createApp() {
     const p = alt ? (ps[1] ?? ps[0]) : ps[0];
     if (p !== undefined) jumpTo(rows.index.get(p)!);
     else if (c.parents.length && !rows.complete) {
-      void engine.call<number>({ method: "ensure", args: { session, hash: c.parents[alt ? 1 : 0] ?? c.parents[0]! } }).then((r) => r >= 0 && jumpTo(r));
+      void ensureRow(c.parents[alt ? 1 : 0] ?? c.parents[0]!).then((r) => r >= 0 && jumpTo(r));
     } else toast("info", "This commit has no parent in the shown history");
   }
   function toChild(alt = false) {
@@ -664,23 +861,32 @@ function createApp() {
 
   // ------------------------------------------------------------------ find
 
-  let findSeq = 0;
   async function runFind(text: string, keepCurrent = false) {
     const seq = ++findSeq;
+    // A re-run after new rows (keepCurrent) can supersede the user's own search while it is in
+    // flight; the jump that search owes must still happen.
+    if (!keepCurrent) findJump = true;
     setFind("text", text);
     if (!text.trim()) {
+      findJump = false;
       setFind({ matches: [], current: -1 });
       return;
     }
-    const matches = await engine.call<number[]>({ method: "search", args: { session, text } }).catch(() => [] as number[]);
+    const refNames: Record<string, string[]> = {};
+    for (const r of repo.refs?.refs ?? []) (refNames[r.commit] ??= []).push(r.short);
+    const matches = await engine.call<number[]>({ method: "search", args: { session, text, refs: refNames } }).catch(() => [] as number[]);
     if (seq !== findSeq) return;
-    let current = keepCurrent && find.current >= 0 ? Math.min(find.current, matches.length - 1) : matches.findIndex((r) => r >= kbRow());
+    const jump = findJump;
+    findJump = false;
+    let current = !jump && find.current >= 0 ? Math.min(find.current, matches.length - 1) : matches.findIndex((r) => r >= kbRow());
     if (current < 0 && matches.length) current = 0;
     setFind({ matches, current });
-    if (!keepCurrent && current >= 0) jumpTo(matches[current]!);
-    if (!matches.length && /^[0-9a-f]{4,40}$/i.test(text.trim()) && !rows.complete) {
-      // Hash not loaded yet: ask the repository, then load history until it appears.
-      const r = await engine.call<number>({ method: "ensure", args: { session, hash: text.trim().toLowerCase(), maxRows: 200_000 } }).catch(() => -1);
+    if (jump && current >= 0) jumpTo(matches[current]!);
+    const t = text.trim().toLowerCase();
+    if (!matches.length && /^[0-9a-f]{4,64}$/.test(t) && repoId()) {
+      // A hash that is not in the graph yet: look it up, then widen the window until it shows.
+      const hit = (await zero.run(queries.repo.commitsByPrefix({ repoId: repoId()!, prefix: t }))) as { hash: string }[];
+      const r = await ensureRow(hit[0]?.hash ?? t, 200_000);
       if (seq === findSeq && r >= 0) {
         setFind({ matches: [r], current: 0 });
         jumpTo(r);
@@ -694,19 +900,8 @@ function createApp() {
     jumpTo(find.matches[cur]!);
   }
 
-  // ------------------------------------------------------------------ session, companion, recents
+  // ------------------------------------------------------------------ account, recents
 
-  async function checkSession() {
-    try {
-      const res = await fetch("/api/v1/session", { credentials: "include", headers: { accept: "application/json" } });
-      const ct = res.headers.get("content-type") ?? "";
-      if (!res.ok || !ct.includes("json")) throw new Error("no server");
-      const s = (await res.json()) as { authenticated: boolean; user?: AuthUser | null; github?: AuthGitHub | null; loginUrl?: string | null; githubConnectUrl?: string | null };
-      setAuth({ checked: true, serverAvailable: true, authenticated: s.authenticated, user: s.user ?? null, github: s.github ?? null, loginEnabled: !!s.loginUrl, githubEnabled: !!s.githubConnectUrl });
-    } catch {
-      setAuth({ checked: true, serverAvailable: false, authenticated: false, user: null, github: null, loginEnabled: false, githubEnabled: false });
-    }
-  }
   function loginUrl() {
     return `/auth/login?returnTo=${encodeURIComponent(address.path())}`;
   }
@@ -714,40 +909,33 @@ function createApp() {
     return `/auth/github/connect?returnTo=${encodeURIComponent(address.path())}`;
   }
 
-  function setCompanion(c: CompanionConfig) {
-    setCompanionSignal(c);
-    save("lanes.companion", c);
-  }
-
-  /** One-time pairing: `git-graph open` puts a single-use code in the URL fragment (never sent to servers). */
-  async function pairFromFragment() {
-    const m = /(?:^|[#&])pair=([A-Za-z0-9_-]{6,128})/.exec(address.hash());
+  /** A companion's pairing code from `git-graph pair` / `git-graph open` (#claim=…): bind it to us. */
+  function claimFromFragment() {
+    const m = /(?:^|[#&])claim=([A-Za-z0-9_-]{6,128})/.exec(address.hash());
     if (!m) return;
     const code = m[1]!;
-    const port = /(?:^|[#&])companion=(\d{2,5})/.exec(address.hash())?.[1];
     // Strip the code from the address bar and history immediately.
     address.replace(address.path());
-    const base = port ? `http://127.0.0.1:${port}` : companion().baseUrl;
-    await pairCompanion(code, base);
-  }
-
-  async function pairCompanion(code: string, baseUrl = companion().baseUrl): Promise<boolean> {
-    try {
-      const res = await fetch(`${baseUrl}/pair`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code }) });
-      const body = (await res.json().catch(() => null)) as { token?: string; error?: { message: string } } | null;
-      if (!res.ok || !body?.token) throw new Error(body?.error?.message ?? `HTTP ${res.status}`);
-      setCompanion({ baseUrl, token: body.token });
-      toast("success", "Connected to the local git-graph companion");
-      return true;
-    } catch (e) {
-      toast("error", "Could not pair with the local companion", `${e instanceof Error ? e.message : String(e)} — run \`git-graph pair\` and paste the new code.`);
-      return false;
+    if (!boot.accountId) {
+      toast("error", "Sign in to connect the companion", "Then run `git-graph pair` again.", { label: "Sign in", run: () => (location.href = loginUrl()) });
+      return;
     }
+    void mutate(mutators.agent.claim({ code, now: Date.now() })).server.then((r) => {
+      if (r.type === "error") toast("error", "Could not connect the companion", r.error?.message);
+      else toast("success", "Companion connected: your local repositories sync to this account");
+    });
   }
 
   function rememberRecent(r: RecentRepo) {
-    const list = [r, ...recents().filter((x) => x.key !== r.key)].slice(0, 20);
-    setRecents(list);
+    const prev = lastVisit.get(r.key);
+    if (prev && r.at - prev < 60_000) return;
+    lastVisit.set(r.key, r.at);
+    if (boot.accountId) {
+      mutate(mutators.repo.visit({ repoId: r.key, name: r.name, path: r.path ?? null, now: r.at }));
+      return;
+    }
+    const list = [r, ...localRecents().filter((x) => x.key !== r.key)].slice(0, 20);
+    setLocalRecents(list);
     save("lanes.recents", list);
   }
 
@@ -788,15 +976,6 @@ function createApp() {
     });
   }
 
-  // ------------------------------------------------------------------ visibility → engine
-
-  const sendVisibility = () =>
-    void engine.call({ method: "visibility", args: { visible: document.visibilityState === "visible", focused: document.hasFocus(), online: navigator.onLine } }).catch(() => {});
-  document.addEventListener("visibilitychange", sendVisibility);
-  window.addEventListener("focus", sendVisibility);
-  window.addEventListener("online", sendVisibility);
-  window.addEventListener("offline", sendVisibility);
-
   // Replace ?at= while scrolling (no history entries).
   let atTimer: ReturnType<typeof setTimeout> | null = null;
   function onScrolled(top: number) {
@@ -810,6 +989,26 @@ function createApp() {
     maybeLoadMore(rowAt(top + (scrollEl?.clientHeight ?? 0)));
   }
 
+  // Preload recent repositories (refs and the newest commits), so switching to one is instant.
+  const preloads: { cleanup: () => void }[] = [];
+  createComputed(
+    on(
+      () => recents()
+        .slice(0, 5)
+        .map((r) => r.key)
+        .join("\n"),
+      (keys) => {
+        for (const p of preloads.splice(0)) p.cleanup();
+        if (IN_STORYBOOK || !keys) return;
+        for (const key of keys.split("\n")) {
+          preloads.push(zero.preload(queries.repo.byId({ repoId: key }), { ttl: "5m" }));
+          preloads.push(zero.preload(queries.repo.refs({ repoId: key }), { ttl: "5m" }));
+          preloads.push(zero.preload(queries.repo.commits({ repoId: key, limit: INITIAL_WINDOW }), { ttl: "5m" }));
+        }
+      },
+    ),
+  );
+
   return {
     engine,
     rows,
@@ -822,13 +1021,10 @@ function createApp() {
     auth,
     /** Stories and tests only: pin the session state. */
     setAuth,
-    checkSession,
     loginUrl,
     githubConnectUrl,
-    companion,
-    setCompanion,
-    pairCompanion,
-    pairFromFragment,
+    claimFromFragment,
+    companions,
     columns,
     setColumns,
     recents,
@@ -864,9 +1060,10 @@ function createApp() {
     headCommit,
     headBranch,
     navigate,
-    openRepo,
+    repoId,
+    ensureRow,
     sessionId: () => session,
-    /** Reactive id of the session whose repository finished opening (0 = none yet). */
+    /** Reactive id of the current repository session. */
     readySession: sessionSig,
     setScrollEl,
     getScrollEl: () => scrollEl,

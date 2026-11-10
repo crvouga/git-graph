@@ -51,17 +51,80 @@ data lives in the shared PostgreSQL; the container can be replaced at any time.
 - Tests use a disposable PostgreSQL (PGlite) with a fresh schema per test server, never the
   shared dev database.
 
+### Zero sync
+
+The web client reads everything through [Zero](https://zero.rocicorp.dev): PostgreSQL is the
+source of truth, zero-cache replicates it to every browser, and the UI renders whatever is in its
+local store (no loading states). See [architecture.md](architecture.md#zero-sync).
+
+The server proxies `/zero/*` (HTTP and WebSocket) to zero-cache, so browsers sync with the same
+origin and the session cookie. zero-cache calls back `/internal/zero/query` and
+`/internal/zero/mutate` with a shared key (`X-Api-Key`). There are two ways to run zero-cache:
+
+- **Embedded (local development, fallback):** the server starts zero-cache as a child process
+  (`ZERO_PORT`, default 4848, loopback only) once migrations have run. `ZERO_API_KEY` is random
+  per boot when unset, so the server and the child always agree.
+- **Sidecar (production):** zero-cache runs as a separate, internal-only service (`lanes-zero`);
+  set `ZERO_CACHE_URL` to its private URL and `ZERO_API_KEY` to the same key on both sides (Vault
+  `LANES_ZERO_API_KEY`). The server then does not start a child process. The sidecar has no public
+  hostname and is only reachable over private networking.
+
+PostgreSQL requirements (both modes):
+
+- `wal_level=logical`; a **direct** (unpooled) connection for `ZERO_UPSTREAM_DB` (defaults to
+  `DATABASE_URL`) whose role may replicate (`REPLICATION`) and create event triggers; the
+  migration creates the publication `lanes_zero` (needs `CREATE` on the database).
+  `ZERO_CVR_DB` / `ZERO_CHANGE_DB` may use a pooler.
+- zero-cache keeps its own state in the schemas `lanes_zero`, `lanes_zero_0`, `lanes_zero_0/cdc`
+  and `lanes_zero_0/cvr` (from `ZERO_APP_ID`, default `lanes_zero`), unless `ZERO_CVR_DB` /
+  `ZERO_CHANGE_DB` move them elsewhere. `DATABASE_SCHEMA` must be a dedicated schema (`lanes`),
+  never `public` or a `pg_*` schema; `ZERO_APP_ID` must not equal or collide with it. Both are
+  validated at boot.
+- The publication's column lists keep tokens and secret hashes in PostgreSQL: they are never
+  replicated to zero-cache or browsers.
+- zero-cache's SQLite replica (`ZERO_REPLICA_FILE`, `/data/replica.db` in the sidecar,
+  `/tmp/lanes-zero/replica.db` embedded) is a cache: losing it costs one initial sync at the next
+  start. A volume makes restarts faster.
+- Local development: `docker run -d -p 5432:5432 -e POSTGRES_PASSWORD=pass postgres:17 -c wal_level=logical`,
+  `psql … -c 'create schema lanes'`, then `DATABASE_URL=postgres://postgres:pass@localhost:5432/postgres pnpm dev:server`.
+
+#### Production sidecar (`lanes-zero`)
+
+The sidecar runs the official image pinned to the same version as `@rocicorp/zero` (1.11.4). It
+is internal-only: no custom domain, no Cloudflare record, one replica, no scale-to-zero, and a
+`/data` volume for the replica. It calls the Lanes service over Railway private networking.
+
+| Sidecar setting | Value |
+| --- | --- |
+| Image | `ghcr.io/rocicorp/zero:1.11.4` |
+| Port / health | `4848` (`ZERO_PORT`); `GET /keepalive` → 200 (allow ≥ 10 min for the first sync) |
+| `ZERO_UPSTREAM_DB` | direct PostgreSQL URL (Vault `ZERO_UPSTREAM_DB`) |
+| `ZERO_CVR_DB` / `ZERO_CHANGE_DB` | optional pooled URLs; default to `ZERO_UPSTREAM_DB` |
+| `ZERO_APP_ID` / `ZERO_APP_PUBLICATIONS` | `lanes_zero` / `lanes_zero` |
+| `ZERO_REPLICA_FILE` | `/data/replica.db` |
+| `ZERO_QUERY_URL` | `http://lanes.railway.internal:8787/internal/zero/query` |
+| `ZERO_MUTATE_URL` | `http://lanes.railway.internal:8787/internal/zero/mutate` |
+| `ZERO_QUERY_API_KEY` / `ZERO_MUTATE_API_KEY` | Vault `LANES_ZERO_API_KEY` |
+| `ZERO_QUERY_FORWARD_COOKIES` / `ZERO_MUTATE_FORWARD_COOKIES` | `true` |
+| `ZERO_ENABLE_CRUD_MUTATIONS` | `false` |
+| `ZERO_ADMIN_PASSWORD` | Vault `LANES_ZERO_ADMIN_PASSWORD` (required in production) |
+| `ZERO_LOG_LEVEL` / `ZERO_NUM_SYNC_WORKERS` | `warn` / `1` |
+
+The Lanes service then needs only `ZERO_CACHE_URL=http://lanes-zero.railway.internal:4848` and
+`ZERO_API_KEY` (Vault `LANES_ZERO_API_KEY`); it does not need `ZERO_UPSTREAM_DB`.
+
 ## Production: `lanes.chrisvouga.dev`
 
-Production follows the shared infrastructure in
-[llms-infra.txt](https://www.chrisvouga.dev/llms-infra.txt) (§5 Hosting): one Railway service
-running a prebuilt public image.
+Production follows the shared cloud infrastructure in
+[llms-cloud.txt](https://www.chrisvouga.dev/llms-cloud.txt) (§ Hosting). It runs two Railway
+services from prebuilt public images: the public `lanes` server and the internal-only
+`lanes-zero` sidecar (see [Zero sync](#production-sidecar-lanes-zero)).
 
 1. Every push to `main` runs `.github/workflows/publish.yml`. It calls the shared workflow in
    `crvouga/personal`, which builds the `Dockerfile` for `linux/amd64` and pushes
    `ghcr.io/crvouga/chrisvouga-lanes:<sha>` and `:latest` (public, anonymous pulls).
 2. It then asks `crvouga/personal` to deploy that SHA. Railway never builds code.
-3. The service, hostname, plain env vars and Vault secrets are declared in `crvouga/personal`'s
+3. The services, hostname, plain env vars and Vault secrets are declared in `crvouga/personal`'s
    OpenTofu inventory. Request changes with a `[hosting] lanes — …` issue on `crvouga/personal`;
    never change them in the Railway dashboard.
 
@@ -69,11 +132,12 @@ running a prebuilt public image.
 | --- | --- |
 | Port | `8787` (`PORT`) |
 | Health check | `GET /health` → 200, no auth, no GitHub calls |
-| Plain env | `PORT=8787`, `APP_ORIGIN=https://lanes.chrisvouga.dev`, `TRUST_PROXY=1`, `GITHUB_APP_SLUG=<slug>`, `OIDC_ISSUER=https://auth.chrisvouga.dev/realms/projects`, `OIDC_CLIENT_ID=<from relay registration>` |
+| Plain env | `PORT=8787`, `APP_ORIGIN=https://lanes.chrisvouga.dev`, `TRUST_PROXY=1`, `GITHUB_APP_SLUG=<slug>`, `OIDC_ISSUER=https://auth.chrisvouga.dev/realms/projects`, `OIDC_CLIENT_ID=<from relay registration>`, `ZERO_CACHE_URL=http://lanes-zero.railway.internal:4848` |
 | Database | schema `lanes` (dev and prd), `DATABASE_URL` from Vault |
 | Relay client | `tools/auth-relay/registration.production.json`, registered with `pnpm relay:register:production` (see [tools/auth-relay/README.md](../tools/auth-relay/README.md)) |
-| Secrets | from Vault, see below |
-| Replicas | exactly 1 |
+| Secrets | from Vault, see below; includes the shared `ZERO_API_KEY` (`LANES_ZERO_API_KEY`) |
+| Sidecar | `lanes-zero`: internal-only zero-cache, port `4848`, 1 replica, `/data` volume |
+| Replicas | exactly 1 for each service |
 
 ### Secrets: Vault (`https://vault.chrisvouga.dev`)
 
@@ -207,7 +271,16 @@ location / {
 | `OIDC_CLIENT_ID` | — | Public client id from the relay registration (`app-<uuid>`). |
 | `OIDC_REDIRECT_URI` | `$APP_ORIGIN/auth/callback` | Must equal the registered callback. |
 | `OIDC_SCOPES` / `OIDC_IDP_HINT` | `openid email profile` / `google` | |
-| `DATABASE_URL` | — | Opaque PostgreSQL URL (Vault). Required with sign-in. |
+| `DATABASE_URL` | — | Opaque PostgreSQL URL (Vault). Required: the web client syncs through Zero, which needs it. |
+| `ZERO` | `1` | `0` turns Zero sync off (API, CLI and MCP only). |
+| `ZERO_CACHE_URL` | — | External zero-cache (internal URL). Default: run zero-cache as a child process. |
+| `ZERO_PORT` | `4848` | Port of the embedded zero-cache (loopback). |
+| `ZERO_UPSTREAM_DB` / `ZERO_CVR_DB` / `ZERO_CHANGE_DB` | `DATABASE_URL` / — / — | Replication source (direct connection) and zero-cache's own databases. |
+| `ZERO_APP_ID` | `lanes_zero` | Names zero-cache's PostgreSQL schemas. |
+| `ZERO_API_KEY` / `ZERO_ADMIN_PASSWORD` | random per boot | zero-cache → server key; zero-cache admin password. |
+| `ZERO_REPLICA_FILE` | `$TMPDIR/lanes-zero-$PORT/replica.db` | zero-cache's SQLite replica (a cache). |
+| `ZERO_CACHE_BIN` | the installed package | Path to zero-cache's `cli.js` (set in the image). |
+| `ZERO_LOG_LEVEL` / `ZERO_NUM_SYNC_WORKERS` | `warn` / zero-cache default | |
 | `DATABASE_SCHEMA` / `DATABASE_POOL_MAX` | `lanes` / `5` | Allocated schema; pool size. |
 | `MIGRATE_ON_BOOT` | `1` | `0` to run `pnpm db:migrate` separately. |
 | `TOKEN_ENCRYPTION_KEY` | — | ≥ 32 bytes. Encrypts stored GitHub tokens. |

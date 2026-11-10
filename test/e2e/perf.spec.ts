@@ -3,8 +3,11 @@ import { expect, test } from "@playwright/test";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
-import { git, openLocal, ROOT, state } from "./harness.ts";
+import { AUTH_STATE, git, openLocal, ROOT, state } from "./harness.ts";
 import { MOD } from "./util.ts";
+
+// Local repositories (and browser-opened folders) sync through the signed-in account.
+test.use({ storageState: AUTH_STATE });
 
 const BUDGET = {
   firstVisibleCommitsMs: 1500,
