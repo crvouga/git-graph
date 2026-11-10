@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Typecheck, unit and integration (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: corepack enable
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+      - run: node test/fixtures/make-fixtures.ts --large 20000
+      - run: pnpm test
+
+  e2e:
+    name: End-to-end against the production build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: corepack enable
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec playwright install --with-deps chromium
+      - run: node test/fixtures/make-fixtures.ts --large
+      - run: pnpm test:e2e
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-results
+          path: |
+            test-results/
+            playwright-report/
+          retention-days: 7
+
+  build:
+    name: Production artifacts and container image
+    runs-on: ubuntu-latest
+    needs: [test]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: corepack enable
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - name: Smoke test the production server
+        run: |
+          PORT=8799 APP_ORIGIN=http://127.0.0.1:8799 SESSION_SECRET=ci-secret-ci-secret-ci-secret-0123456789 node dist/server/server.mjs &
+          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:8799/health && break; sleep 0.5; done
+          curl -fsS http://127.0.0.1:8799/github/octo/repo | grep -q '<div id="app">'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lanes-dist
+          path: dist/
+          retention-days: 14
+      - run: docker build -t lanes:ci .

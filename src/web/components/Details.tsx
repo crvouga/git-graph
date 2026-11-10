@@ -293,6 +293,9 @@ export function Details() {
       { id: "file.copy", label: "Copy Path", run: () => void navigator.clipboard.writeText(f.path).then(() => app.toast("success", "Copied path")) },
       ...(!isWorking() && f.status !== "D" ? [{ id: "file.view", label: "View File at This Revision", run: () => void viewFile(f.path, pair()?.head ?? v().commit!) }] : []),
       { id: "file.history", label: "File History", run: () => void fileHistory(f.path) },
+      ...(!isWorking() && f.status !== "D"
+        ? [{ id: "file.blame", label: "Blame at This Revision", disabled: app.repo.caps?.blame.available ? null : ((app.repo.caps?.blame as { reason?: string } | undefined)?.reason ?? "Unavailable"), run: () => void blame(f.path, pair()?.head ?? v().commit!) }]
+        : []),
     ];
     if (!isWorking()) {
       app.setMenu({ x: pos.x, y: pos.y, title: f.path, items: extra, restore });
@@ -560,6 +563,16 @@ async function viewFile(path: string, rev: string) {
     await app.ask({ title: `${path} @ ${rev.slice(0, 8)}`, output: { text: f.encoding === "utf8" ? f.content : `(binary, ${f.size} bytes)` }, confirmLabel: "Close" });
   } catch (e) {
     app.toast("error", "Could not load file", AppError.from(e).message);
+  }
+}
+
+async function blame(path: string, rev: string) {
+  try {
+    const lines = await portCall<{ line: number; hash: string; author: string; date: number; text: string }[]>("blame", [path, rev]);
+    const text = lines.map((l) => `${l.hash.slice(0, 8)}  ${formatDate(l.date).padEnd(17)}  ${l.author.slice(0, 18).padEnd(18)}  ${String(l.line).padStart(5)}  ${l.text}`).join("\n");
+    await app.ask({ title: `Blame: ${path} @ ${rev.slice(0, 8)}`, output: { text }, confirmLabel: "Close" });
+  } catch (e) {
+    app.toast("error", "Blame failed", AppError.from(e).message);
   }
 }
 

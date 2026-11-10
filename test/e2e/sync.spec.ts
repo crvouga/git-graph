@@ -84,6 +84,20 @@ test("GitHub push delivered by webhook updates the open graph and a second tab w
   const labels = [await page.getByTestId("sync-status").getAttribute("aria-label"), await page2.getByTestId("sync-status").getAttribute("aria-label")];
   expect(labels.filter((l) => l?.includes("shared with another tab")).length).toBe(1);
 
+  // An agent subscribes to the same stream through the public API (no browser involved).
+  const agentEvents: string[] = [];
+  const agentAbort = new AbortController();
+  const agent = (async () => {
+    const res = await fetch(`${s.appOrigin}/api/v1/repositories/github:octo:basic/events`, { headers: { accept: "text/event-stream" }, signal: agentAbort.signal });
+    const reader = res.body!.pipeThrough(new TextDecoderStream()).getReader();
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      for (const m of value.matchAll(/^event: (.+)$/gm)) agentEvents.push(m[1]!);
+    }
+  })().catch(() => {});
+  await expect.poll(() => agentEvents.includes("hello")).toBe(true);
+
   const t0 = Date.now();
   const pushed = await control("/push", { owner: "octo", name: "basic", branch: "main", message: "Pushed on GitHub" });
   console.log("PUSH", JSON.stringify(pushed));
@@ -91,6 +105,9 @@ test("GitHub push delivered by webhook updates the open graph and a second tab w
   await expect(row(page, "Pushed on GitHub")).toBeVisible({ timeout: 5000 });
   const webhookLatency = Date.now() - t0;
   await expect(row(page2, "Pushed on GitHub")).toBeVisible({ timeout: 5000 });
+  await expect.poll(() => agentEvents.filter((e) => e === "refs.changed" || e === "commits.added").length, { timeout: 5000 }).toBeGreaterThan(0);
+  agentAbort.abort();
+  await agent;
   console.log(`webhook receipt → visible graph: ${webhookLatency}ms`);
   test.info().annotations.push({ type: "latency", description: JSON.stringify({ webhookToUiMs: webhookLatency }) });
   await page2.close();

@@ -507,6 +507,28 @@ async function openFolder() {
   }
 }
 
+/** Run a companion-level command (no repository session needed) and open the resulting repository. */
+async function companionCommand(command: string, args: Record<string, unknown>, busy: string) {
+  const c = app.companion();
+  app.setBusy(busy);
+  try {
+    const res = await fetch(`${c.baseUrl}/api/v1/commands/execute`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${c.token}`, "x-client": "ui" },
+      body: JSON.stringify({ command, args }),
+    });
+    const body = (await res.json()) as { ok: boolean; result?: RepoInfo; error?: { message: string } };
+    if (!body.ok || !body.result) throw new Error(body.error?.message ?? `HTTP ${res.status}`);
+    const info = body.result;
+    app.rememberRecent({ key: info.key, name: info.name, path: info.worktreePath, at: Date.now() });
+    app.navigate({ ...app.view(), repo: { provider: "local", id: info.key.split(":")[1]! }, branches: [], commit: null, compare: null, selected: [], view: "graph", file: null, at: null, worktree: null });
+  } catch (e) {
+    app.toast("error", `${busy} failed`, e instanceof Error ? e.message : String(e));
+  } finally {
+    app.setBusy(null);
+  }
+}
+
 export async function openWorktreePath(path: string) {
   try {
     const info = await executeRemote("local.open", { path }, `Open ${path}`);
@@ -560,6 +582,42 @@ function uiCommands(): UiCommand[] {
     ui({ id: "tooltip.show", title: "Show Commit Info", description: "Show the tooltip for the focused commit.", category: "View", shortcuts: ["i"], when: hasRows, execute: () => toggleTooltip() }),
     ui({ id: "graph.refresh", title: "Refresh", description: "Reconcile with the repository now (normally automatic).", category: "Repository", shortcuts: ["r"], when: hasRepo, execute: () => app.engine.call({ method: "refresh", args: { session: app.sessionId(), reason: "manual", force: true } }) }),
     ui({ id: "repo.open", title: "Open Repository…", description: "Open a GitHub repository, a recent repository or a local folder.", category: "Repository", shortcuts: ["o"], scope: "graph", execute: () => app.setPaletteOpen({ mode: "repos" }) }),
+    ui({
+      id: "repo.clone",
+      title: "Clone Repository…",
+      description: "Clone a repository with the local git-graph companion and open it.",
+      category: "Repository",
+      when: () => (app.companion().token ? { enabled: true } : { enabled: false, reason: "Connect the local companion first" }),
+      execute: async () => {
+        const v = await app.ask({
+          title: "Clone repository",
+          fields: [
+            { name: "url", label: "Repository URL", type: "text", required: true, placeholder: "https://github.com/owner/repo.git" },
+            { name: "path", label: "Destination folder (absolute path)", type: "text", required: true },
+          ],
+          confirmLabel: "Clone",
+        });
+        if (v) await companionCommand("local.clone", { url: String(v.url), path: String(v.path) }, `Cloning ${v.url}`);
+      },
+    }),
+    ui({
+      id: "repo.init",
+      title: "Initialize Repository…",
+      description: "Create a new Git repository with the local companion and open it.",
+      category: "Repository",
+      when: () => (app.companion().token ? { enabled: true } : { enabled: false, reason: "Connect the local companion first" }),
+      execute: async () => {
+        const v = await app.ask({
+          title: "Initialize repository",
+          fields: [
+            { name: "path", label: "Folder (absolute path)", type: "text", required: true },
+            { name: "branch", label: "Initial branch (optional)", type: "text", placeholder: "main" },
+          ],
+          confirmLabel: "Initialize",
+        });
+        if (v) await companionCommand("local.init", { path: String(v.path), ...(v.branch ? { initialBranch: String(v.branch) } : {}) }, "Initializing");
+      },
+    }),
     ui({ id: "repo.openFolder", title: "Open Folder in Browser (read-only)…", description: "Open a local repository through the browser's file access.", category: "Repository", execute: () => openFolder() }),
     ui({
       id: "repo.pasteGitHubUrl",
