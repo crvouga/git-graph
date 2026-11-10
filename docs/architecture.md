@@ -11,7 +11,7 @@ Ports and adapters around one repository interface and one command registry.
   └───────────────┬─────────────────────────────┘  │ mutators (agent.*)
                   │ WebSocket /zero (same origin, session cookie)
   ┌───────────────▼──── hosted server (Hono) ───────────────────────┐
-  │ /zero → zero-cache (child process) ⇄ /internal/zero/{query,mutate}│
+  │ /zero → zero-cache (child or sidecar) ⇄ /internal/zero/{query,mutate}│
   │ PostgreSQL "lanes": repos, refs, commits, reads, operations,     │
   │   demands, agents, visits (+ accounts, GitHub links)             │
   │ GitHub agent: demands → GitHubAdapter → SQL; webhooks + poller   │
@@ -30,6 +30,9 @@ synced query (`src/zero/queries.ts`) answered from its local store at once and k
 zero-cache; everything it changes is a mutator (`src/zero/mutators.ts`). There are no loading
 states: the UI renders what is synced, and more appears as it arrives.
 
+- **zero-cache** runs as a child process in local development, or as an internal-only sidecar in
+  production (`ZERO_CACHE_URL`). Browsers always reach it through the server's `/zero` proxy, so
+  the origin and session cookie stay the same; the sidecar has no public hostname.
 - **Repositories are published by source agents.** One generic `RepoSyncer` (`src/agent/`) turns
   any `RepositoryPort` into rows: info and capabilities, refs, history pages, working-tree status.
   The server runs it for GitHub (writing SQL directly), the companion runs it for local

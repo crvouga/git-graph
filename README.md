@@ -71,7 +71,7 @@ src/core        pure, shared: types, RepositoryPort, command registry, URL state
 src/web         SolidJS app; all data through Zero sync; graph worker does ordering, layout, search
 src/zero        Zero schema, synced queries, mutators (shared by web, server, companion)
 src/agent       source agents: publish a repository (any RepositoryPort) into Zero, run queued operations
-src/server      Hono: static SPA, sign-in + sessions, Zero endpoints + embedded zero-cache, GitHub agent, /api/v1, webhooks, SSE, poller
+src/server      Hono: static SPA, sign-in + sessions, Zero endpoints + zero-cache (embedded or sidecar), GitHub agent, /api/v1, webhooks, SSE, poller
 src/github      GitHub adapter (REST, ETag cache, rate limits)
 src/companion   localhost service: Git CLI adapter, watchers, pairing, origin/host checks
 src/browser-git read-only .git reader for the File System Access path

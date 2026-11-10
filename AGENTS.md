@@ -78,7 +78,7 @@ that can alter what is rendered:
   Queue it right away: `gh pr merge --auto --squash`.
 - Every push to `main` publishes the image `ghcr.io/crvouga/chrisvouga-lanes` and deploys it
   (`.github/workflows/publish.yml`, the shared workflow from `crvouga/personal`). See [docs/deploy.md](docs/deploy.md).
-- The server keeps no local state: no disk writes, sessions in the sealed cookie, durable data only in
+- The server keeps no durable local state: no volume, sessions in the sealed cookie, durable data only in
   PostgreSQL (raw parameterized SQL, schema `lanes`, append-only migrations in `src/server/migrations.ts`).
   Sign-in is the shared auth relay (OIDC); GitHub is a connected account (`src/server/auth.ts`).
   Shared cloud infrastructure (Vault, PostgreSQL, R2 object store, hosting, Google sign-in):

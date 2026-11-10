@@ -63,11 +63,25 @@ export const VAULT_KEYS: readonly VaultKey[] = [
     purpose: "Shared PostgreSQL connection URL (already in Vault); Lanes uses only its allocated schema.",
   },
   {
+    env: "ZERO_UPSTREAM_DB",
+    vault: "ZERO_UPSTREAM_DB",
+    required: false,
+    check: (v) => (/^postgres(ql)?:\/\//.test(v) ? null : "is not a postgres:// URL"),
+    purpose: "Optional direct (unpooled) PostgreSQL URL for zero-cache replication. Defaults to DATABASE_URL; the sidecar needs it when DATABASE_URL is pooled.",
+  },
+  {
     env: "ZERO_API_KEY",
     vault: "LANES_ZERO_API_KEY",
     required: true,
     check: (v) => (v.trim().length >= 16 ? null : "must be at least 16 characters (openssl rand -base64 32)"),
     purpose: "Shared key between the Lanes server and the zero-cache sidecar (X-Api-Key on /internal/zero/*). Generate with `openssl rand -base64 32`; keep it stable.",
+  },
+  {
+    env: "ZERO_ADMIN_PASSWORD",
+    vault: "LANES_ZERO_ADMIN_PASSWORD",
+    required: true,
+    check: (v) => (v.trim().length >= 16 ? null : "must be at least 16 characters (openssl rand -base64 24)"),
+    purpose: "zero-cache admin/inspector password for the `lanes-zero` sidecar. Generate with `openssl rand -base64 24`; keep it stable.",
   },
   {
     env: "GITHUB_PUBLIC_TOKEN",

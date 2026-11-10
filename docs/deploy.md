@@ -12,8 +12,11 @@ The hosted server (`src/server/main.ts`, bundled to `dist/server/server.mjs`) se
 - real-time updates over Server-Sent Events (`/api/v1/repositories/:id/events`),
 - `GET /health`.
 
-It is a single Node process with no local state: no volume, nothing written to disk. Durable
-data lives in the shared PostgreSQL; the container can be replaced at any time.
+The Lanes server is a single Node process with no durable local state: no volume, no durable
+disk writes. Durable data lives in the shared PostgreSQL; the container can be replaced at any
+time.
+Production adds an internal-only zero-cache sidecar (`lanes-zero`), whose SQLite replica is a
+disposable cache (see [Zero sync](#zero-sync)).
 
 - **Accounts** (PostgreSQL, schema `lanes`): one row per person, keyed by the auth relay's
   `(issuer, subject)` (never by email), and their connected GitHub account. GitHub user-to-server
@@ -83,8 +86,8 @@ PostgreSQL requirements (both modes):
 - The publication's column lists keep tokens and secret hashes in PostgreSQL: they are never
   replicated to zero-cache or browsers.
 - zero-cache's SQLite replica (`ZERO_REPLICA_FILE`, `/data/replica.db` in the sidecar,
-  `/tmp/lanes-zero/replica.db` embedded) is a cache: losing it costs one initial sync at the next
-  start. A volume makes restarts faster.
+  `$TMPDIR/lanes-zero-$PORT/replica.db` embedded) is a cache: losing it costs one initial sync at
+  the next start. A volume makes restarts faster.
 - Local development: `docker run -d -p 5432:5432 -e POSTGRES_PASSWORD=pass postgres:17 -c wal_level=logical`,
   `psql … -c 'create schema lanes'`, then `DATABASE_URL=postgres://postgres:pass@localhost:5432/postgres pnpm dev:server`.
 
@@ -154,6 +157,9 @@ document is shared by all personal apps. The list is defined once in
 | `LANES_GITHUB_WEBHOOK_SECRET` | `GITHUB_WEBHOOK_SECRET` | yes | the App's webhook secret (`openssl rand -hex 32`) |
 | `LANES_TOKEN_ENCRYPTION_KEY` | `TOKEN_ENCRYPTION_KEY` | yes | `openssl rand -base64 48`; keep it stable (rotating disconnects every GitHub link) |
 | `DATABASE_URL` | `DATABASE_URL` | yes | shared key, already in Vault |
+| `ZERO_UPSTREAM_DB` | `ZERO_UPSTREAM_DB` | no | sidecar only; direct (unpooled) URL for zero-cache replication, defaults to `DATABASE_URL` |
+| `LANES_ZERO_API_KEY` | `ZERO_API_KEY` | yes | `openssl rand -base64 32`; shared by the server and the `lanes-zero` sidecar |
+| `LANES_ZERO_ADMIN_PASSWORD` | `ZERO_ADMIN_PASSWORD` | yes | sidecar only; `openssl rand -base64 24` (zero-cache admin/inspector password) |
 | `LANES_GITHUB_PUBLIC_TOKEN` | `GITHUB_PUBLIC_TOKEN` | no | fine-grained token with no repository access |
 
 - **Production:** the service's inventory entry in `crvouga/personal` binds each runtime name to
@@ -273,15 +279,15 @@ location / {
 | `OIDC_SCOPES` / `OIDC_IDP_HINT` | `openid email profile` / `google` | |
 | `DATABASE_URL` | — | Opaque PostgreSQL URL (Vault). Required: the web client syncs through Zero, which needs it. |
 | `ZERO` | `1` | `0` turns Zero sync off (API, CLI and MCP only). |
-| `ZERO_CACHE_URL` | — | External zero-cache (internal URL). Default: run zero-cache as a child process. |
-| `ZERO_PORT` | `4848` | Port of the embedded zero-cache (loopback). |
-| `ZERO_UPSTREAM_DB` / `ZERO_CVR_DB` / `ZERO_CHANGE_DB` | `DATABASE_URL` / — / — | Replication source (direct connection) and zero-cache's own databases. |
-| `ZERO_APP_ID` | `lanes_zero` | Names zero-cache's PostgreSQL schemas. |
-| `ZERO_API_KEY` / `ZERO_ADMIN_PASSWORD` | random per boot | zero-cache → server key; zero-cache admin password. |
-| `ZERO_REPLICA_FILE` | `$TMPDIR/lanes-zero-$PORT/replica.db` | zero-cache's SQLite replica (a cache). |
+| `ZERO_CACHE_URL` | — | External zero-cache's private URL (production sidecar). Empty: run zero-cache as a child process. |
+| `ZERO_PORT` | `4848` | Port of the embedded zero-cache (loopback) / sidecar. |
+| `ZERO_UPSTREAM_DB` / `ZERO_CVR_DB` / `ZERO_CHANGE_DB` | `DATABASE_URL` / — / — | Replication source (must be direct) and zero-cache's own databases (may be pooled). |
+| `ZERO_APP_ID` | `lanes_zero` | Names zero-cache's PostgreSQL schemas; must not collide with `DATABASE_SCHEMA`. |
+| `ZERO_API_KEY` / `ZERO_ADMIN_PASSWORD` | random per boot | Shared zero-cache → server key (required with `ZERO_CACHE_URL`); zero-cache admin password. |
+| `ZERO_REPLICA_FILE` | `$TMPDIR/lanes-zero-$PORT/replica.db` | zero-cache's SQLite replica (a cache); `/data/replica.db` in the sidecar. |
 | `ZERO_CACHE_BIN` | the installed package | Path to zero-cache's `cli.js` (set in the image). |
 | `ZERO_LOG_LEVEL` / `ZERO_NUM_SYNC_WORKERS` | `warn` / zero-cache default | |
-| `DATABASE_SCHEMA` / `DATABASE_POOL_MAX` | `lanes` / `5` | Allocated schema; pool size. |
+| `DATABASE_SCHEMA` / `DATABASE_POOL_MAX` | `lanes` / `5` | Allocated schema (never `public` or a `pg_*` schema); pool size. |
 | `MIGRATE_ON_BOOT` | `1` | `0` to run `pnpm db:migrate` separately. |
 | `TOKEN_ENCRYPTION_KEY` | — | ≥ 32 bytes. Encrypts stored GitHub tokens. |
 | `ALLOW_ANONYMOUS_ONLY` | — | `1`: allow production without the GitHub App (public repositories only, no webhooks). |
