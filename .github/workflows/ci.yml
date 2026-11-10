@@ -100,9 +100,22 @@ jobs:
         with:
           context: .
           push: false
+          load: true
+          platforms: linux/amd64
           tags: lanes:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      # Stateless: the container must boot and serve with a read-only filesystem.
+      - name: Smoke test the container image (read-only filesystem)
+        run: |
+          docker run -d --name lanes --read-only -p 8788:8787 \
+            -e APP_ORIGIN=http://127.0.0.1:8788 -e SESSION_SECRET=ci-secret-ci-secret-ci-secret-0123456789 lanes:ci
+          for _ in $(seq 1 30); do curl -fsS http://127.0.0.1:8788/health && break; sleep 0.5; done
+          curl -fsS http://127.0.0.1:8788/health
+          curl -fsS http://127.0.0.1:8788/github/octo/repo | grep -q '<div id="app">'
+          docker stop -t 10 lanes
+          docker logs lanes
+          [ "$(docker inspect -f '{{.State.ExitCode}}' lanes)" = "0" ]
 
   storybook:
     name: Storybook stories and screenshots

@@ -1,14 +1,17 @@
 // GitHub sign-in: OAuth authorization-code flow with PKCE (S256) and a single-use `state` bound
 // to the pre-login session cookie. Works for GitHub Apps (user-to-server tokens, 8h expiry with
 // refresh tokens) and OAuth Apps (non-expiring tokens, optional scopes).
+//
+// Sessions are sealed cookies (see session.ts). Handlers change the request's Session object;
+// `commit` (run after every request) re-issues the cookie when it changed or ended.
 
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { Hono, type Context } from "hono";
-import { getCookie, setCookie, deleteCookie } from "hono/cookie";
+import { generateCookie, getCookie } from "hono/cookie";
 import { AppError } from "../core/types.ts";
 import type { GitHubClient } from "../github/client.ts";
 import type { ServerConfig } from "./config.ts";
-import type { GitHubTokens, Session, SessionStore } from "./session.ts";
+import type { CookieView, GitHubTokens, Session, SessionStore } from "./session.ts";
 import { errorResponse } from "./security.ts";
 
 const STATE_TTL_MS = 10 * 60_000;
@@ -62,11 +65,20 @@ interface TokenResponse {
   error_description?: string;
 }
 
+/** What this request's cookie held, and any session it created. */
+interface RequestSession {
+  hadCookie: boolean;
+  view: CookieView | null;
+  created: Session | null;
+}
+
 export class Auth {
   readonly cookieName: string;
   private readonly o: AuthOptions;
   private readonly secure: boolean;
-  private readonly refreshing = new Map<Session, Promise<string>>();
+  /** Keyed by session id: concurrent requests of one session share a single refresh. */
+  private readonly refreshing = new Map<string, Promise<string>>();
+  private readonly requests = new WeakMap<Request, RequestSession>();
 
   constructor(o: AuthOptions) {
     this.o = o;
@@ -79,26 +91,58 @@ export class Auth {
     return !!(this.o.config.githubClientId && this.o.config.githubClientSecret);
   }
 
-  readSession(c: Context): Session | null {
-    return this.o.sessions.get(getCookie(c, this.cookieName));
+  private request(c: Context): RequestSession {
+    let r = this.requests.get(c.req.raw);
+    if (!r) {
+      const raw = getCookie(c, this.cookieName);
+      r = { hadCookie: !!raw, view: this.o.sessions.open(raw), created: null };
+      this.requests.set(c.req.raw, r);
+    }
+    return r;
   }
 
-  private setSessionCookie(c: Context, value: string) {
-    setCookie(c, this.cookieName, value, {
+  readSession(c: Context): Session | null {
+    const r = this.request(c);
+    return r.view?.session ?? r.created;
+  }
+
+  private ensureSession(c: Context): Session {
+    const r = this.request(c);
+    const s = r.view?.session ?? r.created;
+    if (s) return s;
+    return (r.created = this.o.sessions.create());
+  }
+
+  /** After a request: write the session cookie if it changed, needs its idle timeout slid, or ended. */
+  commit(c: Context): void {
+    const r = this.requests.get(c.req.raw);
+    if (!r) return;
+    const s = r.view?.session ?? r.created;
+    if (!s || this.o.sessions.isEnded(s)) {
+      if (r.hadCookie) this.writeCookie(c, null);
+      return;
+    }
+    const v = r.view;
+    if (!v || v.cookieKey !== s.key || v.cookieRev !== s.rev || this.o.now() - v.cookieSeenAt >= this.o.sessions.touchMs) {
+      this.writeCookie(c, this.o.sessions.seal(s));
+    }
+  }
+
+  private writeCookie(c: Context, value: string | null) {
+    const header = generateCookie(this.cookieName, value ?? "", {
       path: "/",
       httpOnly: true,
       secure: this.secure,
       sameSite: "Lax",
-      maxAge: Math.floor(this.o.config.sessionAbsoluteTtlMs / 1000),
+      maxAge: value === null ? 0 : Math.floor(this.o.config.sessionAbsoluteTtlMs / 1000),
     });
-  }
-
-  private ensureSession(c: Context): Session {
-    const s = this.readSession(c);
-    if (s) return s;
-    const { cookie, session } = this.o.sessions.create();
-    this.setSessionCookie(c, cookie);
-    return session;
+    try {
+      c.res.headers.append("set-cookie", header);
+    } catch {
+      // Immutable headers: Hono's setter copies the response into a mutable one.
+      c.res = new Response(c.res.body, c.res);
+      c.res.headers.append("set-cookie", header);
+    }
   }
 
   expiresAt(s: Session): number {
@@ -118,10 +162,11 @@ export class Auth {
     if (!s?.github) return null;
     const g = s.github;
     if (g.accessTokenExpiresAt === null || this.o.now() < g.accessTokenExpiresAt - REFRESH_SKEW_MS) return g.accessToken;
-    let p = this.refreshing.get(s);
+    const id = s.key;
+    let p = this.refreshing.get(id);
     if (!p) {
-      p = this.refresh(s).finally(() => this.refreshing.delete(s));
-      this.refreshing.set(s, p);
+      p = this.refresh(s).finally(() => this.refreshing.delete(id));
+      this.refreshing.set(id, p);
     }
     return p;
   }
@@ -142,7 +187,7 @@ export class Auth {
     }
     if (!r.access_token) return fail(`refresh rejected: ${r.error ?? "unknown"}`);
     s.github = this.tokens(r);
-    this.o.sessions.changed();
+    this.o.sessions.changed(s);
     return r.access_token;
   }
 
@@ -200,6 +245,7 @@ export class Auth {
       const verifier = randomBytes(48).toString("base64url");
       const state = randomBytes(24).toString("base64url");
       s.pending = { state, verifier, returnTo, createdAt: this.o.now() };
+      this.o.sessions.changed(s);
       const u = new URL(`${cfg.githubWebUrl}/login/oauth/authorize`);
       u.searchParams.set("client_id", cfg.githubClientId!);
       u.searchParams.set("redirect_uri", `${cfg.appOrigin}/auth/callback`);
@@ -216,7 +262,10 @@ export class Auth {
       if (!this.configured) return errorResponse(c, new AppError("UNSUPPORTED", "GitHub sign-in is not configured on this server"));
       const s = this.readSession(c);
       const pending = s?.pending ?? null;
-      if (s) s.pending = null; // single use, whatever happens next
+      if (s?.pending) {
+        s.pending = null; // single use, whatever happens next
+        this.o.sessions.changed(s);
+      }
       const state = c.req.query("state") ?? "";
       const code = c.req.query("code") ?? "";
       if (!s || !pending || !state || !eq(state, pending.state) || this.o.now() - pending.createdAt > STATE_TTL_MS) {
@@ -243,7 +292,8 @@ export class Auth {
       }
       s.user = { id: user.id, login: user.login, name: user.name ?? null, avatarUrl: user.avatar_url ?? null };
       s.github = this.tokens(tr);
-      this.setSessionCookie(c, this.o.sessions.rotate(s)); // new id after privilege change
+      s.signedInAt = this.o.now();
+      this.o.sessions.rotate(s); // new id after privilege change
       this.o.log("info", "signed in", { login: user.login });
       c.header("Cache-Control", "no-store");
       return c.redirect(pending.returnTo, 302);
@@ -252,7 +302,6 @@ export class Auth {
     r.post("/logout", (c) => {
       const s = this.readSession(c);
       if (s) this.endSession(s, "logout");
-      deleteCookie(c, this.cookieName, { path: "/", secure: this.secure, httpOnly: true, sameSite: "Lax" });
       return c.json({ ok: true });
     });
 

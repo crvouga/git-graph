@@ -39,7 +39,6 @@ export interface ServerConfig {
   publicToken: string | null;
   oauthScopes: string;
   staticDir: string;
-  dataDir: string | null;
   /** Number of trusted reverse-proxy hops for X-Forwarded-For (0 = ignore the header). */
   trustProxy: number;
   sessionIdleTtlMs: number;
@@ -67,6 +66,7 @@ function num(v: string | undefined, d: number): number {
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   const production = env.NODE_ENV === "production";
   const port = num(env.PORT, 8787);
+  if (production && !env.APP_ORIGIN) throw new Error("APP_ORIGIN must be set in production (the public origin, e.g. https://lanes.chrisvouga.dev)");
   const appOrigin = (env.APP_ORIGIN || `http://localhost:${port}`).replace(/\/+$/, "");
   try {
     const u = new URL(appOrigin);
@@ -96,7 +96,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     publicToken: env.GITHUB_PUBLIC_TOKEN || null,
     oauthScopes: env.GITHUB_OAUTH_SCOPES ?? "read:user",
     staticDir: resolve(process.cwd(), env.STATIC_DIR || "dist/web"),
-    dataDir: env.DATA_DIR === "" ? null : resolve(process.cwd(), env.DATA_DIR || ".data"),
     trustProxy,
     sessionIdleTtlMs: num(env.SESSION_IDLE_TTL_HOURS, 24 * 7) * 3600_000,
     sessionAbsoluteTtlMs: num(env.SESSION_ABSOLUTE_TTL_HOURS, 24 * 30) * 3600_000,
@@ -114,6 +113,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
 
 /** Config for tests / embedding: defaults with overrides, no env. */
 export function testConfig(overrides: Partial<ServerConfig> = {}): ServerConfig {
-  const base = loadConfig({ NODE_ENV: "test", APP_ORIGIN: "http://localhost:8787", DATA_DIR: "" });
+  const base = loadConfig({ NODE_ENV: "test", APP_ORIGIN: "http://localhost:8787" });
   return { ...base, ...overrides, poller: { ...base.poller, ...(overrides.poller ?? {}) } };
 }
