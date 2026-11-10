@@ -111,7 +111,7 @@ export interface FileFocus {
 export const ROW_H = 24;
 export const DETAILS_H = 250;
 export const LANE_W = 16;
-export const GRAPH_PAD = 12;
+export const GRAPH_PAD = 16;
 
 // ---------------------------------------------------------------------------
 
@@ -142,7 +142,7 @@ function createApp() {
   });
 
   const [companion, setCompanionSignal] = createSignal<CompanionConfig>(load("lanes.companion", { baseUrl: "http://127.0.0.1:7420", token: null }));
-  const [columns, setColumnsSignal] = createSignal<Columns>(load("lanes.columns", { graph: null, date: 132, author: 140, hash: 80, showDate: true, showAuthor: true, showHash: true }));
+  const [columns, setColumnsSignal] = createSignal<Columns>(load("lanes.columns.v2", { graph: null, date: 124, author: 110, hash: 76, showDate: true, showAuthor: true, showHash: true }));
   const [recents, setRecents] = createSignal<RecentRepo[]>(load("lanes.recents", []));
   const [theme, setThemeSignal] = createSignal<"system" | "light" | "dark">(load("lanes.themePref", "system"));
 
@@ -175,7 +175,7 @@ function createApp() {
     const showTags = view().display.tags;
     const showStashes = view().display.stashes;
     for (const r of snap.refs) {
-      if (r.kind === "remote" && (!showRemotes || r.symbolicTarget)) continue;
+      if (r.kind === "remote" && !showRemotes) continue;
       if (r.kind === "tag" && !showTags) continue;
       if (r.kind === "stash" && !showStashes) continue;
       const list = m.get(r.commit) ?? [];
@@ -693,7 +693,7 @@ function createApp() {
 
   function setColumns(c: Columns) {
     setColumnsSignal(c);
-    save("lanes.columns", c);
+    save("lanes.columns.v2", c);
   }
 
   function setTheme(t: "system" | "light" | "dark") {

@@ -35,6 +35,8 @@ export function ControlBar() {
   });
   return (
     <div class="controls border-b border-[var(--border)]" role="toolbar" aria-label="Graph controls">
+      <span />
+      <div class="controls-center">
       <label class="ctl">
         Repo:
         <button class="dropdown-btn" aria-haspopup="listbox" title={`Open repository (${formatShortcut("o")})`} onClick={() => invoke("repo.open")}>
@@ -44,7 +46,7 @@ export function ControlBar() {
       <Show when={v().repo}>
         <label class="ctl">
           Branches:
-          <button class="dropdown-btn" aria-haspopup="listbox" title={`Filter branches (${formatShortcut("b")})`} onClick={() => invoke("branches.filter")}>
+          <button class="dropdown-btn" data-dropdown="branches" aria-haspopup="listbox" title={`Filter branches (${formatShortcut("b")})`} onClick={() => invoke("branches.filter")}>
             {branchLabel()}
           </button>
         </label>
@@ -53,7 +55,8 @@ export function ControlBar() {
           Show Remote Branches
         </label>
       </Show>
-      <div class="absolute right-2 flex items-center gap-1">
+      </div>
+      <div class="controls-right">
         <Show when={v().repo}>
           <span class="mr-2 flex items-center gap-1.5 text-xs opacity-80" title={`${syncText().label}\n${syncText().detail}`} aria-label={`${syncText().label}. ${syncText().detail}`} role="status" data-testid="sync-status">
             <span style={{ width: "8px", height: "8px", "border-radius": "50%", background: syncText().dot, display: "inline-block" }} />
@@ -92,7 +95,7 @@ export function ControlBar() {
           <Show
             when={app.auth.authenticated}
             fallback={
-              <button class="ml-1 rounded border border-[var(--border)] px-2 py-0.5 text-xs" onClick={() => invoke("account.signIn")}>
+              <button class="ml-1 rounded border border-[var(--border)] px-2 py-0.5 text-xs whitespace-nowrap" onClick={() => invoke("account.signIn")}>
                 Sign in with GitHub
               </button>
             }

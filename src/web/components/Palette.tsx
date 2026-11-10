@@ -212,13 +212,23 @@ export function Palette() {
     ({
       commands: "Type a command (actions show their target, shortcut, or why they are unavailable)",
       repos: "owner/repo, a GitHub URL, a local path, or search recent repositories",
-      branches: "Filter branches — Enter toggles, Escape closes",
+      branches: "Filter Branches...",
       worktrees: "Pick a worktree — Enter opens it, Shift+F10 for lock/unlock/remove",
     })[mode()];
 
+  // The branch filter opens as a dropdown under its control (Git Graph layout); others are centered.
+  const anchor = mode() === "branches" ? document.querySelector<HTMLElement>('[data-dropdown="branches"]')?.getBoundingClientRect() : null;
+  const panelStyle = anchor ? { position: "fixed" as const, left: `${anchor.left}px`, top: `${anchor.bottom}px`, width: `${Math.max(anchor.width, 240)}px`, margin: "0" } : {};
   return (
     <div class="fixed inset-0 z-50" onMouseDown={(e) => e.target === e.currentTarget && close()} style={{ background: "transparent" }}>
-      <div class="menu mx-auto mt-[8vh] flex w-[640px] max-w-[94vw] flex-col p-0" role="dialog" aria-modal="true" aria-label="Command palette">
+      <div
+        class="menu flex flex-col p-0"
+        classList={{ "mx-auto mt-[8vh] w-[640px] max-w-[94vw]": !anchor }}
+        style={panelStyle}
+        role="dialog"
+        aria-modal="true"
+        aria-label={mode() === "branches" ? "Branch filter" : "Command palette"}
+      >
         <input
           ref={input}
           class="m-2 rounded border border-[var(--focus)] bg-[var(--input-bg)] px-2 py-1 outline-none"
@@ -244,6 +254,8 @@ export function Palette() {
                 aria-selected={active() === i()}
                 aria-disabled={!!it.disabled}
                 aria-checked={it.checked}
+                aria-description={it.detail}
+                title={it.detail}
                 class="menu-item flex-col !items-stretch !gap-0 !whitespace-normal"
                 classList={{ active: active() === i() }}
                 onMouseMove={() => setActive(i())}
@@ -265,7 +277,7 @@ export function Palette() {
                     <span class="kbd ml-auto">{formatShortcut(it.shortcut!)}</span>
                   </Show>
                 </div>
-                <Show when={it.disabled || it.detail}>
+                <Show when={(it.disabled || it.detail) && mode() !== "branches"}>
                   <div class="truncate text-xs opacity-75">{it.disabled ? `Unavailable: ${it.disabled}` : it.detail}</div>
                 </Show>
               </div>

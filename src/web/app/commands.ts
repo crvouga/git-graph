@@ -12,7 +12,7 @@ import { CommandRegistry, defineCommand, type AnyCommand, type MenuContext } fro
 import { repoCommands } from "../../core/commands/repo-commands.ts";
 import { AppError, type MutationResult, type Ref, type Worktree, type Remote, type RepoInfo } from "../../core/types.ts";
 import { buildUrl, parseGitHubInput, WORKING, type ViewState } from "../../core/url/state.ts";
-import { app, type DialogField } from "./store.ts";
+import { app, type DialogField, type MenuItem } from "./store.ts";
 import type { RowCommit } from "../engine/protocol.ts";
 import { isReserved } from "./platform.ts";
 import { fsAccessSupported, newHandleId, saveHandle } from "./handles.ts";
@@ -586,7 +586,7 @@ function uiCommands(): UiCommand[] {
     ui({ id: "view.toggleAuthor", title: "Toggle Author Column", description: "Show or hide the Author column.", category: "View", execute: () => app.setColumns({ ...app.columns(), showAuthor: !app.columns().showAuthor }) }),
     ui({ id: "view.toggleHash", title: "Toggle Commit Column", description: "Show or hide the Commit column.", category: "View", execute: () => app.setColumns({ ...app.columns(), showHash: !app.columns().showHash }) }),
     ui({ id: "columns.resize", title: "Resize Columns…", description: "Focus the first column divider; use ←/→ to resize and Tab to move between dividers.", category: "View", execute: () => document.querySelector<HTMLElement>(".col-resizer")?.focus() }),
-    ui({ id: "columns.reset", title: "Reset Column Widths", description: "Restore default column widths.", category: "View", execute: () => app.setColumns({ graph: null, date: 132, author: 140, hash: 80, showDate: true, showAuthor: true, showHash: true }) }),
+    ui({ id: "columns.reset", title: "Reset Column Widths", description: "Restore default column widths.", category: "View", execute: () => app.setColumns({ graph: null, date: 124, author: 110, hash: 76, showDate: true, showAuthor: true, showHash: true }) }),
     ui({ id: "theme.toggle", title: "Toggle Theme (System / Light / Dark)", description: "Cycle the color theme.", category: "View", execute: () => app.setTheme(app.theme() === "system" ? "light" : app.theme() === "light" ? "dark" : "system") }),
     ui({ id: "link.copy", title: "Copy Link to This View", description: "Copy a deep link that reproduces the current view.", category: "Links", shortcuts: ["y"], when: hasRepo, execute: () => copy(currentLink(), "link") }),
     ui({ id: "link.copyCommit", title: "Copy Link to Commit", description: "Copy a deep link to the focused commit.", category: "Links", contexts: ["commit"], when: hasRows, execute: () => {
@@ -915,6 +915,13 @@ export function openContextMenuForFocus(anchor?: { x: number; y: number }) {
   openMenu(kind, ctx, anchor);
 }
 
+const MENU_ORDER: Partial<Record<MenuContext, string[]>> = {
+  commit: ["git.tag.create", "git.branch.create", "|", "git.checkout", "|", "git.cherry-pick", "git.revert", "|", "git.merge", "git.rebase", "git.reset", "|", "hash.copy", "subject.copy", "|"],
+  ref: ["git.checkout", "worktree.open", "git.branch.rename", "git.branch.delete", "|", "git.merge", "git.rebase", "git.push", "git.upstream.set", "|", "git.tag.push", "git.tag.delete", "|", "branches.focus", "ref.copy", "|"],
+  stash: ["git.stash.apply", "git.stash.branch", "git.stash.pop", "git.stash.drop", "|", "ref.copy", "hash.copy", "|"],
+  uncommitted: ["git.commit", "git.stash.push", "|", "git.clean", "|"],
+};
+
 export function openMenu(kind: MenuContext, ctx: UiContext, anchor?: { x: number; y: number }) {
   const restore = document.activeElement as HTMLElement | null;
   let pos = anchor;
@@ -923,18 +930,36 @@ export function openMenu(kind: MenuContext, ctx: UiContext, anchor?: { x: number
     const r = el?.getBoundingClientRect();
     pos = { x: (r?.left ?? 100) + 8, y: (r?.bottom ?? 100) + 2 };
   }
-  const items = menuCommands(kind).map((cmd) => {
+  const cmds = menuCommands(kind);
+  // Git Graph's grouping and order first, then additional actions.
+  const order = MENU_ORDER[kind] ?? [];
+  const ordered: (AnyCommand | null)[] = [];
+  for (const id of order) {
+    if (id === "|") ordered.push(null);
+    else {
+      const c = cmds.find((x) => x.id === id);
+      if (c) ordered.push(c);
+    }
+  }
+  const rest = cmds.filter((c) => !order.includes(c.id));
+  if (rest.length) ordered.push(null, ...rest);
+  const items: MenuItem[] = [];
+  for (const cmd of ordered) {
+    if (!cmd) {
+      if (items.length && !items[items.length - 1]!.separator) items.push({ id: `sep${items.length}`, label: "", separator: true });
+      continue;
+    }
     const av = commandAvailability(cmd, ctx);
-    return {
+    if (!av.enabled && /^Focus a|^Pick a/.test(av.reason ?? "")) continue; // never applies to this target type
+    const title = commandTitle(cmd, ctx);
+    items.push({
       id: cmd.id,
-      label: commandTitle(cmd, ctx) + (cmd.kind === "mutation" && BINDERS[cmd.id]?.fields ? "…" : ""),
+      label: title + (cmd.kind === "mutation" && BINDERS[cmd.id]?.fields && !title.endsWith("…") ? "…" : ""),
       shortcut: cmd.shortcuts?.[0],
       disabled: av.enabled ? null : (av.reason ?? "Unavailable"),
-      danger: !!cmd.destructive,
       run: () => void (cmd.kind === "mutation" ? invokeMutation(cmd.id, ctx) : invoke(cmd.id, ctx)),
-    };
-  });
-  // Hide entries that can never apply to this target type; keep the ones disabled for a reason.
-  const visible = items.filter((i) => !i.disabled || !/^Focus a|^Pick a/.test(i.disabled));
-  app.setMenu({ x: pos.x, y: pos.y, title: describeTarget(ctx), items: visible, restore });
+    });
+  }
+  while (items.length && items[items.length - 1]!.separator) items.pop();
+  app.setMenu({ x: pos.x, y: pos.y, title: describeTarget(ctx), items, restore });
 }

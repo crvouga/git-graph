@@ -66,7 +66,7 @@ export function GraphView() {
     app.rowsVersion();
     const c = cols().graph;
     if (c) return c;
-    return Math.min(Math.max(GRAPH_PAD * 2 + Math.max(app.rows.width - 1, 0) * LANE_W, 56), 520);
+    return Math.min(Math.max(GRAPH_PAD * 2 + Math.max(app.rows.width - 1, 0) * LANE_W, 48), 520);
   });
 
   const total = createMemo(() => {
@@ -254,7 +254,6 @@ export function GraphView() {
                   fill="none"
                   stroke={p.k === "dashed" ? NEUTRAL : laneColor(Number(p.k))}
                   stroke-width="2"
-                  stroke-dasharray={p.k === "dashed" ? "3 3" : undefined}
                 />
               )}
             </For>
@@ -397,7 +396,7 @@ function Header(p: { graphW: number }) {
           const step = e.shiftKey ? 32 : 8;
           if (e.key === "ArrowLeft") set(current() - sign * step);
           else if (e.key === "ArrowRight") set(current() + sign * step);
-          else if (e.key === "Home") app.setColumns({ ...cols(), [key]: key === "graph" ? null : { date: 132, author: 140, hash: 80 }[key] });
+          else if (e.key === "Home") app.setColumns({ ...cols(), [key]: key === "graph" ? null : { date: 124, author: 110, hash: 76 }[key] });
           else if (e.key === "Escape" || e.key === "Enter") app.focusGraph();
           else return;
           e.preventDefault();

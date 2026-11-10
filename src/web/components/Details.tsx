@@ -299,12 +299,8 @@ export function Details() {
           <WorkingSummary status={app.repo.status} />
         </Show>
         <Show when={!isWorking() && v().compare}>
-          <div class="mb-2 font-bold">Comparing commits</div>
           <div>
-            <b>From:</b> <span class="mono">{pair()?.base.slice(0, 10)}</span> {app.rows.commits[app.rows.index.get(pair()?.base ?? "") ?? -1]?.subject}
-          </div>
-          <div>
-            <b>To:</b> <span class="mono">{pair()?.head.slice(0, 10)}</span> {app.rows.commits[app.rows.index.get(pair()?.head ?? "") ?? -1]?.subject}
+            Displaying all changes from <b class="select-all">{pair()?.base}</b> to <b class="select-all">{pair()?.head}</b>.
           </div>
           <div class="mt-2 text-muted">{comparison.loading ? "Loading…" : `${files().length} files changed`}</div>
           <Show when={comparison.error}>
@@ -334,7 +330,7 @@ export function Details() {
                             app.navigate({ commit: p, view: "details", compare: null, file: null });
                           }}
                         >
-                          {p.slice(0, 10)}
+                          {p}
                         </a>
                       </>
                     )}
@@ -348,12 +344,11 @@ export function Details() {
                   <b>Date: </b>
                   {new Date(d().author.date * 1000).toString()}
                 </div>
-                <Show when={d().committer.name !== d().author.name || d().committer.date !== d().author.date}>
-                  <div>
-                    <b>Committer: </b>
-                    {d().committer.name} ({formatDate(d().committer.date)})
-                  </div>
-                </Show>
+                <div>
+                  <b>Committer: </b>
+                  {d().committer.name} &lt;{d().committer.email}&gt;
+                  {d().committer.date !== d().author.date ? ` (${formatDate(d().committer.date)})` : ""}
+                </div>
                 <Show when={d().signature && d().signature!.status !== "none"}>
                   <div>
                     <b>Signature: </b>
@@ -425,7 +420,7 @@ export function Details() {
                   </Show>
                   <Show when={f && (f.additions !== undefined || f.deletions !== undefined) && !f.binary}>
                     <span class="text-xs">
-                      (<span class="stat-add">+{f!.additions ?? 0}</span>|<span class="stat-del">-{f!.deletions ?? 0}</span>)
+                      ( <span class="stat-add">+{f!.additions ?? 0}</span> | <span class="stat-del">-{f!.deletions ?? 0}</span> )
                     </span>
                   </Show>
                   <Show when={isWorking() && f}>

@@ -13,7 +13,7 @@
 //   edgeStart[r]..[r+1]   edges in the gap between row r-1 and row r (incoming edges of row r)
 //   edges[3*i..]          (fromLane at row r-1, toLane at row r, colorAndFlags)
 // Colors follow branches, Git Graph style: a lane keeps its color for its whole life, and a new
-// lane takes the lowest color that was released on an earlier row.
+// lane takes the lowest color that is free (released on an earlier row).
 
 export const EDGE_DASHED = 0x100;
 export const EDGE_COLOR_MASK = 0xff;
@@ -150,13 +150,13 @@ export class GraphLayout {
 
   private colorKey(r: number): string {
     let k = "";
-    for (let c = 0; c < this.palette; c++) k += `${this.colorUse[c]}${this.colorFreedAt[c]! >= r - 1 ? "r" : ""},`;
+    for (let c = 0; c < this.palette; c++) k += `${this.colorUse[c]}${this.colorFreedAt[c]! >= r ? "r" : ""},`;
     return k;
   }
 
   private takeColor(r: number): number {
     for (let c = 0; c < this.palette; c++) {
-      if (this.colorUse[c] === 0 && this.colorFreedAt[c]! < r - 1) {
+      if (this.colorUse[c] === 0 && this.colorFreedAt[c]! < r) {
         this.colorUse[c]!++;
         return c;
       }
