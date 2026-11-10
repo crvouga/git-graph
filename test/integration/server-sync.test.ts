@@ -1,6 +1,3 @@
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { GitHubAdapter } from "../../src/github/adapter.ts";
 import { GitHubClient } from "../../src/github/client.ts";
@@ -65,20 +62,6 @@ describe("webhook receiver", () => {
     expect(await r2.json()).toMatchObject({ duplicate: true });
     expect(s.server.webhooks.stats.processed - before.processed).toBe(1);
     expect(published.filter((e) => e.event.type === "commits.added")).toHaveLength(1);
-  });
-
-  it("de-duplicates durably across restarts (DATA_DIR)", async () => {
-    const dataDir = mkdtempSync(join(tmpdir(), "lanes-data-"));
-    try {
-      const a = await startStack({ fake, config: { dataDir, poller: NO_POLL } });
-      expect((await a.webhook("ping", {}, { delivery: "durable-1" })).status).toBe(202);
-      await a.close();
-      const b = await startStack({ fake, config: { dataDir, poller: NO_POLL } });
-      expect(await (await b.webhook("ping", {}, { delivery: "durable-1" })).json()).toMatchObject({ duplicate: true });
-      await b.close();
-    } finally {
-      rmSync(dataDir, { recursive: true, force: true });
-    }
   });
 
   it("is unavailable without a secret", async () => {

@@ -70,7 +70,11 @@ that can alter what is rendered:
   Head branches are deleted automatically after merge.
 - `main` takes no direct pushes or force pushes. A PR merges once the single required check, **CI ok**, passes.
   Queue it right away: `gh pr merge --auto --squash`.
-- Every green CI run on `main` deploys (`.github/workflows/deploy.yml`, once `FLY_API_TOKEN` is set).
+- Every push to `main` publishes the image `ghcr.io/crvouga/chrisvouga-lanes` and deploys it
+  (`.github/workflows/publish.yml`, the shared workflow from `crvouga/personal`). See [docs/deploy.md](docs/deploy.md).
+- The server must stay stateless: no disk writes, sessions in the sealed cookie, in-memory caches only.
+  Shared infra (Vault, PostgreSQL, R2 object store, hosting, Google sign-in):
+  https://www.chrisvouga.dev/llms-infra.txt
 - GitHub settings (merge methods, branch rules, security) live in `.github/repo-settings.json`.
   Change them there, then `pnpm github:plan` / `pnpm github:apply`. Don't change them in the GitHub UI;
   the weekly drift check fails if you do. To add a CI job to the gate, add it to `ci-ok.needs`.

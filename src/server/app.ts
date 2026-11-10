@@ -51,7 +51,6 @@ export function createServerApp(config: ServerConfig): ServerApp {
   const registry = new SubscriptionRegistry(hub);
   const sessions = new SessionStore({
     secret: config.sessionSecret,
-    dataDir: config.dataDir,
     idleTtlMs: config.sessionIdleTtlMs,
     absoluteTtlMs: config.sessionAbsoluteTtlMs,
   });
@@ -133,7 +132,6 @@ export function createServerApp(config: ServerConfig): ServerApp {
 
   const webhooks = new Webhooks({
     secret: config.webhookSecret,
-    dataDir: config.dataDir,
     hub,
     reconciler: rec,
     log,
@@ -142,6 +140,7 @@ export function createServerApp(config: ServerConfig): ServerApp {
     onUserRevoked: (userId, login) => {
       log("info", "app authorization revoked", { login });
       for (const s of sessions.findByUserId(userId)) authInst.endSession(s, "app authorization revoked");
+      sessions.revokeUser(userId); // also sessions this process has not seen since it started
       registry.revoke((p) => p?.userId === userId);
     },
   });
@@ -179,6 +178,10 @@ export function createServerApp(config: ServerConfig): ServerApp {
   };
 
   app.use("*", securityHeaders(config.appOrigin));
+  app.use("*", async (c, next) => {
+    await next();
+    authInst.commit(c);
+  });
   app.onError((err, c) => {
     const e = AppError.from(err);
     if (e.code === "INTERNAL") log("error", "unhandled error", { error: err instanceof Error ? err.message : String(err), path: new URL(c.req.url).pathname });
@@ -278,7 +281,6 @@ export function createServerApp(config: ServerConfig): ServerApp {
       poll.close();
       rec.close();
       webhooks.close();
-      sessions.close();
     },
   };
 }

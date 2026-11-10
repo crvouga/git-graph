@@ -108,7 +108,6 @@ export async function startHarness(): Promise<E2EState> {
       GITHUB_API_URL: fake.url,
       GITHUB_WEB_URL: fake.url,
       GITHUB_WEBHOOK_SECRET: WEBHOOK_SECRET,
-      DATA_DIR: join(fixturesRoot, "server-data"),
       STATIC_DIR: join(ROOT, "dist/web"),
     },
     "server",

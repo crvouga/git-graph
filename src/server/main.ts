@@ -5,7 +5,14 @@ import { serve } from "@hono/node-server";
 import { createServerApp } from "./app.ts";
 import { loadConfig } from "./config.ts";
 
-const config = loadConfig(process.env);
+let config: ReturnType<typeof loadConfig>;
+try {
+  config = loadConfig(process.env);
+} catch (e) {
+  // Fail fast with a message that names the missing or invalid variable.
+  console.error(JSON.stringify({ t: new Date().toISOString(), level: "error", msg: `invalid configuration: ${e instanceof Error ? e.message : String(e)}` }));
+  process.exit(1);
+}
 const server = createServerApp(config);
 
 const warn = (msg: string) => console.log(JSON.stringify({ t: new Date().toISOString(), level: "warn", msg }));

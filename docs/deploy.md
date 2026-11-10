@@ -10,8 +10,76 @@ The hosted server (`src/server/main.ts`, bundled to `dist/server/server.mjs`) se
 - real-time updates over Server-Sent Events (`/api/v1/repositories/:id/events`),
 - `GET /health`.
 
-It is a single Node process with no database. Sessions and recent webhook delivery ids persist
-to `DATA_DIR` (sessions encrypted with a key derived from `SESSION_SECRET`).
+It is a single, stateless Node process: no database, no volume, nothing written to disk.
+
+- **Sessions** live in the browser as one sealed cookie (AES-256-GCM, key derived from
+  `SESSION_SECRET`). The browser cannot read or change it, and any server with the same secret
+  can read it, so sessions survive restarts and redeploys.
+- **Everything else is an in-memory cache** that is safe to lose: the event hub, the poller, the
+  GitHub response cache, recent webhook delivery ids, recently seen sessions and ended session ids.
+  After a restart, clients reconnect and resync; a webhook redelivered across a restart is
+  processed again, which is safe because processing is idempotent.
+
+## Production: `lanes.chrisvouga.dev`
+
+Production follows the shared infrastructure in
+[llms-infra.txt](https://www.chrisvouga.dev/llms-infra.txt) (§5 Hosting): one Railway service
+running a prebuilt public image.
+
+1. Every push to `main` runs `.github/workflows/publish.yml`. It calls the shared workflow in
+   `crvouga/personal`, which builds the `Dockerfile` for `linux/amd64` and pushes
+   `ghcr.io/crvouga/chrisvouga-lanes:<sha>` and `:latest` (public, anonymous pulls).
+2. It then asks `crvouga/personal` to deploy that SHA. Railway never builds code.
+3. The service, hostname, plain env vars and Vault secrets are declared in `crvouga/personal`'s
+   OpenTofu inventory. Request changes with a `[hosting] lanes — …` issue on `crvouga/personal`;
+   never change them in the Railway dashboard.
+
+| Setting | Value |
+| --- | --- |
+| Port | `8787` (`PORT`) |
+| Health check | `GET /health` → 200, no auth, no GitHub calls |
+| Plain env | `PORT=8787`, `APP_ORIGIN=https://lanes.chrisvouga.dev`, `TRUST_PROXY=1`, `GITHUB_APP_SLUG=<slug>` |
+| Secrets | from Vault, see below |
+| Replicas | exactly 1 |
+
+### Secrets: Vault (`https://vault.chrisvouga.dev`)
+
+Every secret lives in the shared KV document `secret/personal/<config>` (`prd` for production,
+`dev` for local work, same key names in both). Lanes' keys carry a `LANES_` prefix because the
+document is shared by all personal apps. The list is defined once in
+[`src/server/vault-keys.ts`](../src/server/vault-keys.ts):
+
+| Vault key | Runtime env | Required | Value |
+| --- | --- | --- | --- |
+| `LANES_SESSION_SECRET` | `SESSION_SECRET` | yes | `openssl rand -base64 48`; keep it stable (rotating signs everyone out) |
+| `LANES_GITHUB_CLIENT_ID` | `GITHUB_CLIENT_ID` | yes | GitHub App → Client ID |
+| `LANES_GITHUB_CLIENT_SECRET` | `GITHUB_CLIENT_SECRET` | yes | GitHub App → Generate a new client secret |
+| `LANES_GITHUB_WEBHOOK_SECRET` | `GITHUB_WEBHOOK_SECRET` | yes | the App's webhook secret (`openssl rand -hex 32`) |
+| `LANES_GITHUB_PUBLIC_TOKEN` | `GITHUB_PUBLIC_TOKEN` | no | fine-grained token with no repository access |
+
+- **Production:** the service's inventory entry in `crvouga/personal` binds each runtime name to
+  its Vault key (`{ "name": "SESSION_SECRET", "source": "vault", "vault_key": "LANES_SESSION_SECRET" }`),
+  so they arrive as plain env vars. The server never talks to Vault itself.
+- **Local:** `pnpm dev:server:vault` runs the server under `personal infra-vault run` (config from
+  `.vault.yaml`), which injects the `LANES_…` names; the server accepts either name.
+- **Checked on every change:** the CI job *Vault secrets present* logs in with GitHub OIDC (role
+  `github-actions`) and runs `pnpm vault:check`. It prints key names and problems only, and raises
+  a warning (with the list in the job summary) when a required key is missing or malformed in
+  `prd` or `dev`. It is advisory, not part of **CI ok**: a release missing a secret still never
+  goes live, because the server refuses to boot and fails its health check. Run it locally after
+  `vault login`.
+- **Adding or changing a key:** open a `[secrets] lanes — …` issue on `crvouga/personal` with key
+  names only. Vault contents are managed by OpenTofu there; never write them by hand.
+- **At boot**, in production the server exits with a message naming any missing `APP_ORIGIN`,
+  `SESSION_SECRET`, `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET` or `GITHUB_WEBHOOK_SECRET`, so a
+  misconfigured release fails its health check instead of going live. `ALLOW_ANONYMOUS_ONLY=1`
+  allows a deliberately sign-in-free deployment.
+
+The GitHub App's callback URL is `https://lanes.chrisvouga.dev/auth/callback` and its webhook URL
+is `https://lanes.chrisvouga.dev/webhooks/github`.
+
+Redeploy a given commit (a human, from a machine with access to `crvouga/personal`):
+`gh workflow run deploy.yml -R crvouga/personal -f action=deploy -f service_id=lanes -f image_tag=<sha>`.
 
 ## 1. Create the GitHub App
 
@@ -37,43 +105,27 @@ For development with auto-reload: `pnpm dev:server` (runs `src/server/main.ts` d
 
 ```sh
 docker build -t lanes .
-docker run -d --name lanes -p 8787:8787 --env-file .env \
-  -e NODE_ENV=production -e APP_ORIGIN=https://git-graph.example.com \
-  -v lanes-data:/data lanes
+docker run --rm --read-only -p 8787:8787 --env-file .env \
+  -e APP_ORIGIN=http://localhost:8787 lanes
+curl -fsS localhost:8787/health
 ```
 
-The image runs `node dist/server/server.mjs` as the unprivileged `node` user, with
-`STATIC_DIR=/app/dist/web` and `DATA_DIR=/data`. Mount a volume at `/data` so sessions and the
-webhook de-duplication log survive restarts. A `HEALTHCHECK` probes `/health`.
-
-## 4. Fly.io (or any container host)
-
-`deploy/fly.toml` is a working example:
-
-```sh
-fly launch --no-deploy --copy-config -c deploy/fly.toml
-fly volumes create lanes_data --size 1 -c deploy/fly.toml
-fly secrets set -c deploy/fly.toml \
-  SESSION_SECRET="$(openssl rand -base64 48)" \
-  GITHUB_CLIENT_ID=Iv1.xxxx GITHUB_CLIENT_SECRET=xxxx GITHUB_WEBHOOK_SECRET=xxxx
-fly deploy -c deploy/fly.toml --dockerfile Dockerfile .
-```
-
-Set `APP_ORIGIN` in `fly.toml` to your public origin (custom domain or `*.fly.dev`).
-
-Other hosts (Render, Railway, Cloud Run, Kubernetes, a VM): run the image, expose port 8787,
-set the environment variables below, mount persistent storage at `/data`, and route
-`https://<your-domain>` to it.
+The image runs `node dist/server/server.mjs` as the unprivileged `node` user with
+`NODE_ENV=production` and `STATIC_DIR=/app/dist/web`. It needs no volume and no database, and
+runs with a read-only filesystem (CI checks this). In production it exits at boot with a message
+naming any missing required variable (add `-e ALLOW_ANONYMOUS_ONLY=1` to try it without a GitHub App). A `HEALTHCHECK` probes `/health`; `SIGTERM` shuts down
+gracefully. Any container host works the same way: run the image, set the environment variables
+below, and route `https://<your-domain>` to port 8787.
 
 ### Run exactly one instance
 
-The event hub, poller and session cache are in-process. Run **one** replica (scale vertically);
-with several replicas, SSE subscribers and webhooks could land on different instances. Sessions
-survive restarts via `DATA_DIR`. After a restart, clients see a new stream epoch and reconcile
-automatically (`resync`), and the poller re-reads refs for every repository with subscribers.
+The event hub and poller are in-process. Run **one** replica (scale vertically); with several
+replicas, SSE subscribers and webhooks could land on different instances. Sessions need no
+server state, so restarts and redeploys keep everyone signed in. After a restart, clients see a
+new stream epoch and reconcile automatically (`resync`), and the poller re-reads refs for every
+repository with subscribers.
 
-Disable scale-to-zero (`auto_stop_machines = "off"` on Fly): SSE streams and the poller need a
-running process.
+Disable scale-to-zero: SSE streams and the poller need a running process.
 
 ## TLS and reverse proxies
 
@@ -83,7 +135,7 @@ Terminate TLS at the platform or a reverse proxy; the server speaks plain HTTP. 
 
 Reverse-proxy requirements:
 
-- Set `TRUST_PROXY` to the number of proxies that append to `X-Forwarded-For` (Fly: `1`), so rate
+- Set `TRUST_PROXY` to the number of proxies that append to `X-Forwarded-For` (Railway: `1`), so rate
   limits see the real client IP. Leave it `0` when the server is reachable directly.
 - Do not buffer SSE: the server sends `X-Accel-Buffering: no` (nginx honors it); for other
   proxies disable response buffering for `/api/v1/repositories/*/events` and allow long-lived
@@ -114,8 +166,9 @@ location / {
 | `PORT` | `8787` | HTTP port. |
 | `HOST` | `0.0.0.0` | Bind address. |
 | `APP_ORIGIN` | `http://localhost:$PORT` | Public origin (scheme+host[+port]). OAuth redirect, CSRF, cookies, HSTS. |
-| `NODE_ENV` | — | `production` requires `SESSION_SECRET`. |
-| `SESSION_SECRET` | random (dev only) | ≥ 32 bytes. Encrypts persisted sessions. Rotating it signs everyone out. |
+| `NODE_ENV` | `production` in the image | `production` requires `APP_ORIGIN`, `SESSION_SECRET` and the GitHub App variables. |
+| `ALLOW_ANONYMOUS_ONLY` | — | `1`: allow production without the GitHub App (public repositories only, no webhooks). |
+| `SESSION_SECRET` | random (dev only) | ≥ 32 bytes. Encrypts the session cookie. Rotating it signs everyone out. |
 | `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | — | GitHub App (or OAuth App) credentials. Without them: anonymous, public repos only. |
 | `GITHUB_APP_SLUG` | — | Optional; exposed to the UI for install links. |
 | `GITHUB_OAUTH_SCOPES` | `read:user` | OAuth App fallback only; `repo read:user` to read private repos. GitHub Apps ignore scopes. |
@@ -124,7 +177,6 @@ location / {
 | `GITHUB_API_URL` | `https://api.github.com` | GitHub Enterprise Server: `https://ghe.example.com/api/v3`. |
 | `GITHUB_WEB_URL` | `https://github.com` | GitHub Enterprise Server: `https://ghe.example.com`. |
 | `STATIC_DIR` | `dist/web` | Built SPA, relative to the working directory. |
-| `DATA_DIR` | `.data` | Encrypted sessions + webhook delivery log. Empty string = memory only. |
 | `TRUST_PROXY` | `0` | Trusted proxy hops for `X-Forwarded-For`. |
 | `SESSION_IDLE_TTL_HOURS` | `168` | Idle session lifetime. |
 | `SESSION_ABSOLUTE_TTL_HOURS` | `720` | Absolute session lifetime. |
@@ -135,7 +187,7 @@ location / {
 ## How real-time sync works
 
 1. GitHub delivers `push` / `create` / `delete` / `repository` / installation events to
-   `/webhooks/github`. The server verifies the signature, records the delivery id durably,
+   `/webhooks/github`. The server verifies the signature, drops already-seen delivery ids,
    answers `202` immediately and processes the event on an in-process queue (bounded retries with
    exponential back-off).
 2. Ref-affecting events trigger a reconciliation: the server re-reads the refs from GitHub with
@@ -159,9 +211,15 @@ re-checks access.
 
 ## Security notes
 
-- GitHub tokens live only in the server-side session store (encrypted at rest). The browser holds
-  an opaque random session id in an `HttpOnly`, `SameSite=Lax` cookie (`__Host-` + `Secure` on
-  https).
+- GitHub tokens live only inside the sealed session cookie (AES-256-GCM): the browser stores it
+  but cannot read or change it, and JavaScript cannot see it (`HttpOnly`, `SameSite=Lax`,
+  `__Host-` + `Secure` on https). The session id changes on sign-in.
+- Logout and revocation end the session in the running process right away (an old copy of the
+  cookie stops working). After a restart, an old copy stays valid until GitHub rejects its token
+  or the session expires; revoking the app on GitHub ends every session at once.
+- A token refresh that happens where no cookie can be written (an open event stream, a background
+  poll) is kept in memory and written on the next request. If the process restarts in between,
+  that user signs in again.
 - OAuth uses PKCE (S256) and a single-use `state` bound to the pre-login session, valid 10 minutes.
   `returnTo` must be a same-origin relative path.
 - Strict CSP, `X-Content-Type-Options`, `Referrer-Policy: no-referrer`, `frame-ancestors 'none'`,

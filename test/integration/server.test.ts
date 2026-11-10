@@ -1,6 +1,3 @@
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { cleanupGitHubFixture } from "../fakes/github.ts";
 import { CookieJar, ORIGIN, startFake, startStack, sleep, type Stack } from "../fakes/server-harness.ts";
@@ -203,25 +200,42 @@ describe("GitHub sign-in", () => {
     }
   });
 
-  it("persists signed-in sessions encrypted in DATA_DIR across restarts", async () => {
-    const dataDir = mkdtempSync(join(tmpdir(), "lanes-sessions-"));
+  it("keeps sessions in a sealed cookie: they survive a restart without server state", async () => {
     const sessionSecret = "s".repeat(48);
+    const a = await startStack({ fake, config: { sessionSecret } });
+    const jar = await a.login("alice");
+    await a.close();
+    const cookie = jar.header();
+    for (const t of fake.tokens.keys()) expect(cookie).not.toContain(t);
+    for (const t of fake.refreshTokens.keys()) expect(cookie).not.toContain(t);
+    expect(cookie).not.toContain("alice");
+    const b = await startStack({ fake, config: { sessionSecret } }); // a new process, nothing on disk
     try {
-      const a = await startStack({ fake, config: { dataDir, sessionSecret } });
-      const jar = await a.login("alice");
-      await a.close(); // flushes the store
-      const file = readFileSync(join(dataDir, "sessions.enc"));
-      for (const t of fake.tokens.keys()) expect(file.includes(Buffer.from(t))).toBe(false);
-      expect(file.includes(Buffer.from("alice"))).toBe(false);
-      const b = await startStack({ fake, config: { dataDir, sessionSecret } });
       expect((await (await b.req("/api/v1/session", { jar })).json()).user.login).toBe("alice");
-      await b.close();
-      const c = await startStack({ fake, config: { dataDir, sessionSecret: "x".repeat(48) } }); // rotated secret
-      expect((await (await c.req("/api/v1/session", { jar })).json()).authenticated).toBe(false);
-      await c.close();
+      // a tampered cookie is ignored and cleared
+      const [name, value] = [...jar.cookies][0]!;
+      const forged = new CookieJar();
+      forged.cookies.set(name, value.slice(0, -4) + (value.endsWith("AAAA") ? "BBBB" : "AAAA"));
+      const r = await b.req("/api/v1/session", { jar: forged });
+      expect((await r.json()).authenticated).toBe(false);
+      expect(forged.cookies.has(name)).toBe(false);
     } finally {
-      rmSync(dataDir, { recursive: true, force: true });
+      await b.close();
     }
+    const c = await startStack({ fake, config: { sessionSecret: "x".repeat(48) } }); // rotated secret
+    try {
+      expect((await (await c.req("/api/v1/session", { jar })).json()).authenticated).toBe(false);
+    } finally {
+      await c.close();
+    }
+  });
+
+  it("an old copy of the cookie stops working after logout", async () => {
+    const jar = await s.login("alice");
+    const copy = new CookieJar();
+    for (const [k, v] of jar.cookies) copy.cookies.set(k, v);
+    expect((await s.req("/auth/logout", { method: "POST", jar, headers: { origin: ORIGIN } })).status).toBe(200);
+    expect((await (await s.req("/api/v1/session", { jar: copy })).json()).authenticated).toBe(false);
   });
 
   it("expires idle sessions", async () => {

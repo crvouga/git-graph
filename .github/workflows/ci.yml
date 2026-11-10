@@ -100,9 +100,23 @@ jobs:
         with:
           context: .
           push: false
+          load: true
+          platforms: linux/amd64
           tags: lanes:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      # Stateless: the container must boot and serve with a read-only filesystem.
+      - name: Smoke test the container image (read-only filesystem)
+        run: |
+          docker run -d --name lanes --read-only -p 8788:8787 \
+            -e APP_ORIGIN=http://127.0.0.1:8788 -e SESSION_SECRET=ci-secret-ci-secret-ci-secret-0123456789 \
+            -e ALLOW_ANONYMOUS_ONLY=1 lanes:ci
+          for _ in $(seq 1 30); do curl -fsS http://127.0.0.1:8788/health && break; sleep 0.5; done
+          curl -fsS http://127.0.0.1:8788/health
+          curl -fsS http://127.0.0.1:8788/github/octo/repo | grep -q '<div id="app">'
+          docker stop -t 10 lanes
+          docker logs lanes
+          [ "$(docker inspect -f '{{.State.ExitCode}}' lanes)" = "0" ]
 
   storybook:
     name: Storybook stories and screenshots
@@ -143,6 +157,48 @@ jobs:
           path: .ui-shots/
           include-hidden-files: true
           retention-days: 14
+
+  # Every secret the release needs exists in Vault (names and shape only; values are never printed).
+  # Advisory: reports missing keys as warnings and is not part of "CI ok". A release without its
+  # secrets still cannot go live: the server refuses to boot and fails its health check.
+  vault:
+    name: Vault secrets present
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Vault token (GitHub OIDC, role github-actions)
+        env:
+          VAULT_ADDR: https://vault.chrisvouga.dev
+        run: |
+          # Vault restarts sealed and auto-unseals: wait for it before failing.
+          for i in $(seq 1 20); do
+            [ "$(curl -s -o /dev/null -w '%{http_code}' "$VAULT_ADDR/v1/sys/health?standbyok=true")" = "200" ] && break
+            echo "Vault not ready, retrying ($i)"; sleep 15
+          done
+          jwt=$(curl -fsS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$VAULT_ADDR" | jq -r .value)
+          token=$(jq -n --arg jwt "$jwt" '{role: "github-actions", jwt: $jwt}' \
+            | curl -fsS -X POST --data @- "$VAULT_ADDR/v1/auth/jwt/login" | jq -r .auth.client_token)
+          echo "::add-mask::$token"
+          echo "VAULT_TOKEN=$token" >> "$GITHUB_ENV"
+      - name: Check release secrets (warns when missing)
+        run: |
+          set +e
+          node scripts/check-vault.ts --config prd --config dev | tee vault-check.txt
+          code=${PIPESTATUS[0]}
+          if [ "$code" != "0" ]; then
+            missing=$(grep -E '^\s+FAIL' vault-check.txt | awk '{print $2}' | sort -u | paste -sd ', ' -)
+            echo "::warning title=Vault secrets missing::${missing:-Vault check failed (exit $code)}. Request them on crvouga/personal; the server will not boot without them."
+            { echo "### Vault secrets missing"; echo; echo '```'; cat vault-check.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit 0
 
   # The only check the main ruleset requires (see .github/repo-settings.json).
   # Add new jobs to `needs` instead of editing the ruleset.

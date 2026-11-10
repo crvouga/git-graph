@@ -3,6 +3,7 @@
 
 import { randomBytes } from "node:crypto";
 import { resolve } from "node:path";
+import { withVaultAliases } from "./vault-keys.ts";
 
 export interface RateLimitConfig {
   /** Bucket size (burst). */
@@ -39,7 +40,6 @@ export interface ServerConfig {
   publicToken: string | null;
   oauthScopes: string;
   staticDir: string;
-  dataDir: string | null;
   /** Number of trusted reverse-proxy hops for X-Forwarded-For (0 = ignore the header). */
   trustProxy: number;
   sessionIdleTtlMs: number;
@@ -64,9 +64,11 @@ function num(v: string | undefined, d: number): number {
   return v !== undefined && v !== "" && Number.isFinite(n) ? n : d;
 }
 
-export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
+export function loadConfig(rawEnv: NodeJS.ProcessEnv = process.env): ServerConfig {
+  const env = withVaultAliases(rawEnv);
   const production = env.NODE_ENV === "production";
   const port = num(env.PORT, 8787);
+  if (production && !env.APP_ORIGIN) throw new Error("APP_ORIGIN must be set in production (the public origin, e.g. https://lanes.chrisvouga.dev)");
   const appOrigin = (env.APP_ORIGIN || `http://localhost:${port}`).replace(/\/+$/, "");
   try {
     const u = new URL(appOrigin);
@@ -76,8 +78,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   }
   let sessionSecret = env.SESSION_SECRET ?? "";
   if (Buffer.byteLength(sessionSecret) < 32) {
-    if (production) throw new Error("SESSION_SECRET must be set to at least 32 bytes in production (e.g. `openssl rand -base64 48`)");
+    if (production) throw new Error("SESSION_SECRET (Vault LANES_SESSION_SECRET) must be set to at least 32 bytes in production (e.g. `openssl rand -base64 48`)");
     sessionSecret = randomBytes(48).toString("base64");
+  }
+  // Sign-in needs both halves; a deploy missing either is broken, not "anonymous".
+  if (!!env.GITHUB_CLIENT_ID !== !!env.GITHUB_CLIENT_SECRET) {
+    throw new Error(`${env.GITHUB_CLIENT_ID ? "GITHUB_CLIENT_SECRET" : "GITHUB_CLIENT_ID"} is missing (both GitHub App credentials are needed for sign-in)`);
+  }
+  if (production && !/^(1|true|yes)$/i.test(env.ALLOW_ANONYMOUS_ONLY ?? "")) {
+    const missing = ["GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET", "GITHUB_WEBHOOK_SECRET"].filter((k) => !env[k]);
+    if (missing.length) throw new Error(`${missing.join(", ")} must be set in production (from Vault LANES_${missing[0]}), or set ALLOW_ANONYMOUS_ONLY=1 to run without sign-in and webhooks`);
   }
   const tp = (env.TRUST_PROXY ?? "").trim().toLowerCase();
   const trustProxy = tp === "true" || tp === "yes" ? 1 : tp === "false" || tp === "" ? 0 : Math.max(0, Math.floor(num(tp, 0)));
@@ -96,7 +106,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     publicToken: env.GITHUB_PUBLIC_TOKEN || null,
     oauthScopes: env.GITHUB_OAUTH_SCOPES ?? "read:user",
     staticDir: resolve(process.cwd(), env.STATIC_DIR || "dist/web"),
-    dataDir: env.DATA_DIR === "" ? null : resolve(process.cwd(), env.DATA_DIR || ".data"),
     trustProxy,
     sessionIdleTtlMs: num(env.SESSION_IDLE_TTL_HOURS, 24 * 7) * 3600_000,
     sessionAbsoluteTtlMs: num(env.SESSION_ABSOLUTE_TTL_HOURS, 24 * 30) * 3600_000,
@@ -114,6 +123,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
 
 /** Config for tests / embedding: defaults with overrides, no env. */
 export function testConfig(overrides: Partial<ServerConfig> = {}): ServerConfig {
-  const base = loadConfig({ NODE_ENV: "test", APP_ORIGIN: "http://localhost:8787", DATA_DIR: "" });
+  const base = loadConfig({ NODE_ENV: "test", APP_ORIGIN: "http://localhost:8787" });
   return { ...base, ...overrides, poller: { ...base.poller, ...(overrides.poller ?? {}) } };
 }

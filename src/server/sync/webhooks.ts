@@ -1,13 +1,12 @@
 // GitHub webhook receiver.
 //  1. Verify X-Hub-Signature-256 (HMAC-SHA256 over the raw body, timing-safe) → 401 otherwise.
-//  2. De-duplicate by X-GitHub-Delivery, durably: the id is appended to DATA_DIR before we ack.
+//  2. De-duplicate by X-GitHub-Delivery (in memory: the server is stateless; a redelivery after a
+//     restart is processed again, which is safe because processing is idempotent).
 //  3. Acknowledge fast (202) and process on an in-process queue with bounded exponential retry.
 // Processing is idempotent and never applies payload state blindly: ref-affecting events trigger
 // a reconciliation that re-reads authoritative refs from GitHub.
 
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { appendFileSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
 import type { Context } from "hono";
 import { AppError, repoKey } from "../../core/types.ts";
 import type { EventHub } from "../../core/sync/hub.ts";
@@ -21,50 +20,25 @@ export function verifySignature(secret: string, body: Uint8Array, header: string
   return got.length === want.length && timingSafeEqual(got, want);
 }
 
-/** Bounded, durable set of recently seen delivery ids. */
+/** Bounded in-memory set of recently seen delivery ids. */
 export class DeliveryLog {
   private readonly ids = new Set<string>();
   private readonly order: string[] = [];
-  private readonly file: string | null;
   private readonly max: number;
-  private appended = 0;
 
-  constructor(dataDir: string | null, max = 10_000) {
-    this.file = dataDir ? join(dataDir, "webhook-deliveries.log") : null;
+  constructor(max = 10_000) {
     this.max = max;
-    if (this.file) {
-      try {
-        const lines = readFileSync(this.file, "utf8").split("\n").filter(Boolean);
-        for (const id of lines.slice(-max)) this.remember(id);
-      } catch {
-        /* first start */
-      }
-    }
   }
 
   has(id: string): boolean {
     return this.ids.has(id);
   }
 
-  private remember(id: string) {
+  add(id: string) {
     if (this.ids.has(id)) return;
     this.ids.add(id);
     this.order.push(id);
     while (this.order.length > this.max) this.ids.delete(this.order.shift()!);
-  }
-
-  /** Record the id; persisted synchronously so a crash after acking cannot reprocess it. */
-  add(id: string) {
-    this.remember(id);
-    if (!this.file) return;
-    mkdirSync(join(this.file, ".."), { recursive: true });
-    appendFileSync(this.file, `${id}\n`);
-    if (++this.appended > this.max) {
-      this.appended = 0;
-      const tmp = `${this.file}.tmp`;
-      writeFileSync(tmp, this.order.join("\n") + "\n");
-      renameSync(tmp, this.file);
-    }
   }
 
   get size(): number {
@@ -82,7 +56,6 @@ interface Job {
 
 export interface WebhookOptions {
   secret: string | null;
-  dataDir: string | null;
   hub: EventHub;
   reconciler: Reconciler;
   /** A repository's access changed (privatized, deleted, app removed): drop cached authorization. */
@@ -136,7 +109,7 @@ export class Webhooks {
 
   constructor(o: WebhookOptions) {
     this.o = o;
-    this.deliveries = new DeliveryLog(o.dataDir);
+    this.deliveries = new DeliveryLog();
   }
 
   async handle(c: Context): Promise<Response> {
