@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Lanes \u2014 a fast, keyboard-first, URL-driven Git graph for the web",
+  "description": "Lanes — a fast, keyboard-first, URL-driven Git graph for the web",
   "bin": {
     "git-graph": "dist/cli/git-graph.mjs"
   },
@@ -13,6 +13,7 @@
   "scripts": {
     "dev": "vite",
     "dev:server": "node --watch src/server/main.ts",
+    "dev:server:vault": "personal infra-vault run -- node --watch src/server/main.ts",
     "storybook": "storybook dev -p 6006 --no-open",
     "storybook:build": "storybook build -o storybook-static --quiet",
     "ui:shots": "node scripts/ui-shots.ts",
@@ -22,6 +23,7 @@
     "build:web": "vite build",
     "build:node": "node scripts/build-node.ts",
     "start": "node dist/server/server.mjs",
+    "vault:check": "node scripts/check-vault.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run",
     "test:unit": "vitest run test/unit",

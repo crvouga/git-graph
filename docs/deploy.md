@@ -38,9 +38,41 @@ running a prebuilt public image.
 | --- | --- |
 | Port | `8787` (`PORT`) |
 | Health check | `GET /health` → 200, no auth, no GitHub calls |
-| Plain env | `APP_ORIGIN=https://lanes.chrisvouga.dev`, `TRUST_PROXY=1` |
-| Vault secrets (`personal/prd`) | `SESSION_SECRET`, `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET`, `GITHUB_WEBHOOK_SECRET`, optional `GITHUB_APP_SLUG`, `GITHUB_PUBLIC_TOKEN` |
+| Plain env | `PORT=8787`, `APP_ORIGIN=https://lanes.chrisvouga.dev`, `TRUST_PROXY=1`, `GITHUB_APP_SLUG=<slug>` |
+| Secrets | from Vault, see below |
 | Replicas | exactly 1 |
+
+### Secrets: Vault (`https://vault.chrisvouga.dev`)
+
+Every secret lives in the shared KV document `secret/personal/<config>` (`prd` for production,
+`dev` for local work, same key names in both). Lanes' keys carry a `LANES_` prefix because the
+document is shared by all personal apps. The list is defined once in
+[`src/server/vault-keys.ts`](../src/server/vault-keys.ts):
+
+| Vault key | Runtime env | Required | Value |
+| --- | --- | --- | --- |
+| `LANES_SESSION_SECRET` | `SESSION_SECRET` | yes | `openssl rand -base64 48`; keep it stable (rotating signs everyone out) |
+| `LANES_GITHUB_CLIENT_ID` | `GITHUB_CLIENT_ID` | yes | GitHub App → Client ID |
+| `LANES_GITHUB_CLIENT_SECRET` | `GITHUB_CLIENT_SECRET` | yes | GitHub App → Generate a new client secret |
+| `LANES_GITHUB_WEBHOOK_SECRET` | `GITHUB_WEBHOOK_SECRET` | yes | the App's webhook secret (`openssl rand -hex 32`) |
+| `LANES_GITHUB_PUBLIC_TOKEN` | `GITHUB_PUBLIC_TOKEN` | no | fine-grained token with no repository access |
+
+- **Production:** the service's inventory entry in `crvouga/personal` binds each runtime name to
+  its Vault key (`{ "name": "SESSION_SECRET", "source": "vault", "vault_key": "LANES_SESSION_SECRET" }`),
+  so they arrive as plain env vars. The server never talks to Vault itself.
+- **Local:** `pnpm dev:server:vault` runs the server under `personal infra-vault run` (config from
+  `.vault.yaml`), which injects the `LANES_…` names; the server accepts either name.
+- **Checked on every change:** the CI job *Vault secrets present* logs in with GitHub OIDC (role
+  `github-actions`) and runs `pnpm vault:check`. It prints key names and problems only, and fails
+  when a required key is missing or malformed in `prd` or `dev`. It is part of **CI ok**, so
+  nothing merges, and so nothing deploys, while a release secret is missing. Run it locally after
+  `vault login`.
+- **Adding or changing a key:** open a `[secrets] lanes — …` issue on `crvouga/personal` with key
+  names only. Vault contents are managed by OpenTofu there; never write them by hand.
+- **At boot**, in production the server exits with a message naming any missing `APP_ORIGIN`,
+  `SESSION_SECRET`, `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET` or `GITHUB_WEBHOOK_SECRET`, so a
+  misconfigured release fails its health check instead of going live. `ALLOW_ANONYMOUS_ONLY=1`
+  allows a deliberately sign-in-free deployment.
 
 The GitHub App's callback URL is `https://lanes.chrisvouga.dev/auth/callback` and its webhook URL
 is `https://lanes.chrisvouga.dev/webhooks/github`.
@@ -78,9 +110,9 @@ curl -fsS localhost:8787/health
 ```
 
 The image runs `node dist/server/server.mjs` as the unprivileged `node` user with
-`NODE_ENV=production` and `STATIC_DIR=/app/dist/web`. It needs no volume and runs with a read-only
-filesystem (CI checks this). In production it exits at boot with a message naming the variable if
-`APP_ORIGIN` or `SESSION_SECRET` is missing. A `HEALTHCHECK` probes `/health`; `SIGTERM` shuts down
+`NODE_ENV=production` and `STATIC_DIR=/app/dist/web`. It needs no volume and no database, and
+runs with a read-only filesystem (CI checks this). In production it exits at boot with a message
+naming any missing required variable (add `-e ALLOW_ANONYMOUS_ONLY=1` to try it without a GitHub App). A `HEALTHCHECK` probes `/health`; `SIGTERM` shuts down
 gracefully. Any container host works the same way: run the image, set the environment variables
 below, and route `https://<your-domain>` to port 8787.
 
@@ -133,7 +165,8 @@ location / {
 | `PORT` | `8787` | HTTP port. |
 | `HOST` | `0.0.0.0` | Bind address. |
 | `APP_ORIGIN` | `http://localhost:$PORT` | Public origin (scheme+host[+port]). OAuth redirect, CSRF, cookies, HSTS. |
-| `NODE_ENV` | `production` in the image | `production` requires `APP_ORIGIN` and `SESSION_SECRET`. |
+| `NODE_ENV` | `production` in the image | `production` requires `APP_ORIGIN`, `SESSION_SECRET` and the GitHub App variables. |
+| `ALLOW_ANONYMOUS_ONLY` | — | `1`: allow production without the GitHub App (public repositories only, no webhooks). |
 | `SESSION_SECRET` | random (dev only) | ≥ 32 bytes. Encrypts the session cookie. Rotating it signs everyone out. |
 | `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` | — | GitHub App (or OAuth App) credentials. Without them: anonymous, public repos only. |
 | `GITHUB_APP_SLUG` | — | Optional; exposed to the UI for install links. |
