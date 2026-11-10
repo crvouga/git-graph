@@ -9,3 +9,6 @@ playwright-report
 .env.*
 !.env.example
 .DS_Store
+.shot.mjs
+.perf.mjs
+.data
