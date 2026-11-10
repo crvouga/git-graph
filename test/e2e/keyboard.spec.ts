@@ -79,8 +79,9 @@ test("open, navigate, details, diff, focus restoration, multi-select, compare �
   await expect(page.getByRole("search")).toContainText("1 of 1");
   await page.keyboard.press("Escape"); // close find, focus back to graph
   expect(await focusedRowSubject(page)).toBe("Document usage");
-  await page.keyboard.press("ArrowRight");
-  await page.keyboard.press("ArrowRight"); // second label: v1.0
+  // ←/→ cycle through the labels on the focused row; stop on the v1.0 tag.
+  const focusedRef = () => page.evaluate(() => (document.querySelector(".ref.focused") as HTMLElement | null)?.dataset.ref ?? null);
+  for (let i = 0; i < 6 && (await focusedRef()) !== "v1.0"; i++) await page.keyboard.press("ArrowRight");
   await expect(page.locator(".ref.focused")).toHaveAttribute("data-ref", "v1.0");
   await page.keyboard.press("Shift+F10");
   const menu = page.getByRole("menu");

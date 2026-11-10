@@ -590,7 +590,8 @@ const mutationSpecs: MutationSpec[] = [
     capability: "conflicts",
     shape: { path: pathArg, resolution: z.union([z.enum(["ours", "theirs"]), z.object({ content: z.string().max(20_000_000) })]) },
     contexts: ["file"],
-    consequence: (a) => `Overwrite "${a.path}" with ${typeof a.resolution === "string" ? `the "${a.resolution}" version` : "the edited content"} and stage it.`,
+    // Saving content the user just edited is not destructive; picking a side discards the working file.
+    consequence: (a) => (typeof a.resolution === "string" ? `Overwrite "${a.path}" with the "${a.resolution}" version (discarding its current working-tree content, including any manual edits) and stage it.` : null),
   },
   {
     op: "clean",

@@ -50,7 +50,7 @@ export function Palette() {
 
   const close = (refocus = true) => {
     app.setPaletteOpen(false);
-    if (refocus) requestAnimationFrame(() => (restore && document.contains(restore) && restore !== document.body ? restore.focus() : app.focusGraph()));
+    if (refocus) app.restoreFocus(() => (restore && restore !== document.body ? restore : null));
   };
 
   const [ghRepos] = createResource(
@@ -169,7 +169,7 @@ export function Palette() {
     }
     if (!query) return items();
     return items()
-      .map((it) => ({ it, s: fuzzyScore(query, it.label) }))
+      .map((it) => ({ it, s: Math.max(fuzzyScore(query, it.label), mode() === "worktrees" ? fuzzyScore(query, `${it.label} ${it.detail ?? ""}`) - 1 : -1) }))
       .filter((x) => x.s > 0)
       .sort((a, b) => (a.it.disabled ? 1 : 0) - (b.it.disabled ? 1 : 0) || b.s - a.s)
       .map((x) => x.it);

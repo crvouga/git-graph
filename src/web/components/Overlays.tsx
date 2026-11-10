@@ -19,7 +19,7 @@ export function ContextMenu() {
   const close = (refocus = true) => {
     const r = m().restore;
     app.setMenu(null);
-    if (refocus) requestAnimationFrame(() => (r && document.contains(r) && r !== document.body ? r.focus() : app.focusGraph()));
+    if (refocus) app.restoreFocus(() => (r && r !== document.body ? r : null));
   };
   onMount(() => {
     // Keep on screen.
@@ -306,7 +306,7 @@ export function Help() {
   const restore = document.activeElement as HTMLElement | null;
   const close = () => {
     app.setHelpOpen(false);
-    requestAnimationFrame(() => (restore && document.contains(restore) && restore !== document.body ? restore.focus() : app.focusGraph()));
+    app.restoreFocus(() => (restore && restore !== document.body ? restore : null));
   };
   const rows = createMemo(() => {
     const all = [

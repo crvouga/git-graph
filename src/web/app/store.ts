@@ -525,15 +525,33 @@ function createApp() {
   function closeDiff() {
     const path = focusMemory.diffFrom ?? view().file;
     navigate({ view: "details", file: null });
+    restoreFocus(() => (path ? document.querySelector<HTMLElement>(`[data-file-path="${CSS.escape(path)}"]`) : null));
+  }
+
+  /**
+   * Deferred focus restoration that never steals focus: it only applies if, by the time it runs,
+   * focus is lost (on <body> or a detached element) — not if the user already opened something else.
+   */
+  function restoreFocus(target: () => HTMLElement | null | undefined) {
+    const owner = document.activeElement;
+    // Synchronous when the target exists already, so keys typed right after closing never hit <body>.
+    const now = target();
+    if (now && document.contains(now) && (owner === document.body || !owner || !document.contains(owner) || owner === now || owner.closest('[role="search"],[role="dialog"],[role="alertdialog"],[role="menu"]'))) {
+      now.focus({ preventScroll: true });
+      return;
+    }
     requestAnimationFrame(() => {
-      const el = path ? document.querySelector<HTMLElement>(`[data-file-path="${CSS.escape(path)}"]`) : null;
-      if (el) el.focus();
-      else focusGraph();
+      const a = document.activeElement;
+      const lost = !a || a === document.body || !document.contains(a) || a === owner;
+      if (!lost) return;
+      const t = target();
+      if (t && document.contains(t)) t.focus({ preventScroll: true });
+      else scrollEl?.focus({ preventScroll: true });
     });
   }
 
   function focusGraph() {
-    requestAnimationFrame(() => scrollEl?.focus({ preventScroll: true }));
+    restoreFocus(() => scrollEl);
   }
 
   function moveKb(delta: number) {
@@ -723,7 +741,7 @@ function createApp() {
         resolve: (v) => {
           setDialog(null);
           resolve(v);
-          requestAnimationFrame(() => (restore && document.contains(restore) ? restore.focus() : focusGraph()));
+          restoreFocus(() => (restore && restore !== document.body ? restore : null));
         },
       });
     });
@@ -819,6 +837,7 @@ function createApp() {
     openDiff,
     closeDiff,
     focusGraph,
+    restoreFocus,
     moveKb,
     jumpTo,
     toParent,
