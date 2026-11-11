@@ -22,6 +22,8 @@ export const ALL_HISTORY: HistoryQuery = { refs: [], includeRemotes: true, inclu
 const PAGE = 500;
 /** Largest single write (commits per mutation). */
 const BATCH = 500;
+/** Size of the first write for a repository: a couple of screens of rows. */
+const FIRST_BATCH = 100;
 /** How far a refresh walks down one changed ref before giving up on finding known commits. */
 const REFRESH_WALK = 5000;
 /** Read results larger than this (JSON) are replaced by an error. */
@@ -167,9 +169,12 @@ export class RepoSyncer {
       if (complete !== undefined) await this.o.writer.commits(this.repoId, [], complete);
       return;
     }
-    for (let i = 0; i < commits.length; i += BATCH) {
-      const batch = commits.slice(i, i + BATCH);
-      await this.o.writer.commits(this.repoId, batch, i + BATCH >= commits.length ? complete : undefined);
+    // The very first write is small: it is what a viewer waits for, and it fills the screen.
+    for (let i = 0; i < commits.length; ) {
+      const n = this.known.size === 0 ? FIRST_BATCH : BATCH;
+      const batch = commits.slice(i, i + n);
+      i += batch.length;
+      await this.o.writer.commits(this.repoId, batch, i >= commits.length ? complete : undefined);
       for (const c of batch) this.known.add(c.hash);
     }
   }
