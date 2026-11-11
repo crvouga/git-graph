@@ -39,8 +39,10 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           docker run -d --name pg -p 55432:5432 -e POSTGRES_PASSWORD=pass postgres:17 -c wal_level=logical
-          for i in $(seq 1 30); do docker exec pg pg_isready -U postgres && break; sleep 1; done
-          docker exec pg psql -U postgres -c 'create schema lanes'
+          # Over TCP: the image's temporary init server (socket only) shuts down right after
+          # pg_isready first succeeds, so retry until the real server has the schema.
+          for i in $(seq 1 60); do docker exec -e PGPASSWORD=pass pg psql -h 127.0.0.1 -U postgres -qc 'create schema if not exists lanes' && break; sleep 1; done
+          docker exec -e PGPASSWORD=pass pg psql -h 127.0.0.1 -U postgres -Atqc "select 1 from pg_namespace where nspname = 'lanes'" | grep -qx 1
           echo "LANES_ZERO_TEST_DB=postgres://postgres:pass@localhost:55432/postgres" >> "$GITHUB_ENV"
       - run: pnpm test
 
@@ -72,8 +74,10 @@ jobs:
       - name: PostgreSQL for Zero sync
         run: |
           docker run -d --name pg -p 55432:5432 -e POSTGRES_PASSWORD=pass postgres:17 -c wal_level=logical
-          for i in $(seq 1 30); do docker exec pg pg_isready -U postgres && break; sleep 1; done
-          docker exec pg psql -U postgres -c 'create schema lanes'
+          # Over TCP: the image's temporary init server (socket only) shuts down right after
+          # pg_isready first succeeds, so retry until the real server has the schema.
+          for i in $(seq 1 60); do docker exec -e PGPASSWORD=pass pg psql -h 127.0.0.1 -U postgres -qc 'create schema if not exists lanes' && break; sleep 1; done
+          docker exec -e PGPASSWORD=pass pg psql -h 127.0.0.1 -U postgres -Atqc "select 1 from pg_namespace where nspname = 'lanes'" | grep -qx 1
           echo "LANES_ZERO_TEST_DB=postgres://postgres:pass@localhost:55432/postgres" >> "$GITHUB_ENV"
       - run: pnpm test:e2e
       - uses: actions/upload-artifact@v4
