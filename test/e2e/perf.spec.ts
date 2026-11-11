@@ -25,6 +25,9 @@ test("100k-commit history stays fast and responsive", async ({ page, context }) 
   test.skip(!s.large, "Run `node test/fixtures/make-fixtures.ts --large` to create the 100k fixture");
   const results: Record<string, number | string> = {};
   const { url } = openLocal(s.large!);
+  // PERF_CPU_THROTTLE=4 slows this machine's CPU down to roughly a shared CI runner's.
+  const throttle = Number(process.env.PERF_CPU_THROTTLE ?? 0);
+  if (throttle > 1) await (await context.newCDPSession(page)).send("Emulation.setCPUThrottlingRate", { rate: throttle });
 
   // Time to first visible commits / first usable graph (keyboard navigation works).
   const t0 = Date.now();

@@ -18,6 +18,16 @@ function visibleRepos(q: RepoQuery, ctx: ZeroContext | undefined): RepoQuery {
   return q.where(({ or, cmp, exists }) => or(cmp("is_public", true), exists("access", (a) => a.where("account_id", account))));
 }
 
+/**
+ * Keep rows of repositories the viewer may read. The browser's own store only ever holds rows the
+ * server already allowed, and re-checking every streamed commit there costs scroll frames, so a
+ * trusted client store skips it (the server never sets `trustedStore`).
+ */
+function onVisibleRepo<Q>(q: Q, ctx: ZeroContext | undefined): Q {
+  if (ctx?.trustedStore) return q;
+  return (q as unknown as { whereExists(rel: "repo", cb: (r: RepoQuery) => RepoQuery): Q }).whereExists("repo", (r) => visibleRepos(r, ctx));
+}
+
 const repoArgs = z.object({ repoId: z.string().min(1).max(300) });
 const MAX_WINDOW = 50_000;
 
@@ -26,31 +36,21 @@ export const queries = defineQueries({
     /** One repository row (info, capabilities, HEAD, working-tree status, sync state). */
     byId: defineQuery(repoArgs, ({ args, ctx }) => visibleRepos(zql.repos.where("id", args.repoId), ctx).one()),
     refs: defineQuery(repoArgs, ({ args, ctx }) =>
-      zql.refs.where("repo_id", args.repoId).whereExists("repo", (r) => visibleRepos(r, ctx)),
+      onVisibleRepo(zql.refs.where("repo_id", args.repoId), ctx),
     ),
     /** The newest `limit` commits by committer date: the window the graph is computed from. */
     commits: defineQuery(repoArgs.extend({ limit: z.number().int().min(1).max(MAX_WINDOW) }), ({ args, ctx }) =>
-      zql.commits
-        .where("repo_id", args.repoId)
-        .whereExists("repo", (r) => visibleRepos(r, ctx))
+      onVisibleRepo(zql.commits.where("repo_id", args.repoId), ctx)
         .orderBy("committer_date", "desc")
         .orderBy("hash", "asc")
         .limit(args.limit),
     ),
     commit: defineQuery(repoArgs.extend({ hash: z.string().regex(/^[0-9a-f]{40,64}$/) }), ({ args, ctx }) =>
-      zql.commits
-        .where("repo_id", args.repoId)
-        .where("hash", args.hash)
-        .whereExists("repo", (r) => visibleRepos(r, ctx))
-        .one(),
+      onVisibleRepo(zql.commits.where("repo_id", args.repoId).where("hash", args.hash), ctx).one(),
     ),
     /** Commits whose hash starts with `prefix` (short hashes in links and find). */
     commitsByPrefix: defineQuery(repoArgs.extend({ prefix: z.string().regex(/^[0-9a-f]{4,64}$/) }), ({ args, ctx }) =>
-      zql.commits
-        .where("repo_id", args.repoId)
-        .where("hash", "LIKE", `${args.prefix}%`)
-        .whereExists("repo", (r) => visibleRepos(r, ctx))
-        .limit(5),
+      onVisibleRepo(zql.commits.where("repo_id", args.repoId).where("hash", "LIKE", `${args.prefix}%`), ctx).limit(5),
     ),
     /** The viewer's own demand for a repository: tells why a repository cannot be shown. */
     demand: defineQuery(repoArgs, ({ args, ctx }) => zql.demands.where("id", demandId(args.repoId, ctx?.accountId ?? null)).one()),
@@ -58,12 +58,10 @@ export const queries = defineQueries({
   reads: {
     /** A cached repository read (commit details, diff, file, blame…). */
     byId: defineQuery(z.object({ id: z.string().min(1).max(600) }), ({ args, ctx }) =>
-      zql.reads
-        .where("id", args.id)
-        .where(({ or, cmp, exists }) =>
-          or(cmp("account_id", me(ctx)), exists("repo", (r) => visibleRepos(r, ctx))),
-        )
-        .one(),
+      (ctx?.trustedStore
+        ? zql.reads.where("id", args.id)
+        : zql.reads.where("id", args.id).where(({ or, cmp, exists }) => or(cmp("account_id", me(ctx)), exists("repo", (r) => visibleRepos(r, ctx))))
+      ).one(),
     ),
   },
   operations: {
