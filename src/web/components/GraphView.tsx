@@ -2,7 +2,7 @@
 // visible window is in the DOM), one SVG overlay for lanes/edges of the visible window, and the
 // commit details panel expanded in place below the selected row.
 
-import { createEffect, createMemo, createSignal, For, Index, onCleanup, onMount, Show, type JSX } from "solid-js";
+import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, type JSX } from "solid-js";
 import { EDGE_COLOR_MASK, EDGE_DASHED, NODE_STASH, NODE_WORKING } from "../../core/graph/layout.ts";
 import { WORKING } from "../../core/url/state.ts";
 import type { Ref } from "../../core/types.ts";
@@ -272,9 +272,10 @@ export function GraphView() {
               }
             </For>
           </svg>
-          <Index each={indices()}>
+          {/* Keyed by row number: rows that stay in view keep their DOM while scrolling. */}
+          <For each={indices()}>
             {(ri) => {
-              const r = ri;
+              const r = () => ri;
               const c = () => {
                 app.rowsVersion();
                 return app.rows.commits[r()];
@@ -342,7 +343,7 @@ export function GraphView() {
                 </Show>
               );
             }}
-          </Index>
+          </For>
           <Show when={app.expandedRow() >= 0}>
             <div class="details" style={{ top: `${app.rowTop(app.expandedRow()) + ROW_H}px`, height: `${DETAILS_H}px`, left: `${graphW()}px` }}>
               <Details />
