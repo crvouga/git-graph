@@ -192,6 +192,12 @@ export interface ZeroContext {
    * companion holds nothing in memory; the server applies the writes).
    */
   skipLocalIngest?: boolean;
+  /**
+   * Client-side only (the web app's own store): every repository row there already passed the
+   * server's visibility check, so queries skip re-checking it per row. The server always builds
+   * its own context from the session and never sets this.
+   */
+  trustedStore?: boolean;
 }
 
 declare module "@rocicorp/zero" {

@@ -25,6 +25,9 @@ test("100k-commit history stays fast and responsive", async ({ page, context }) 
   test.skip(!s.large, "Run `node test/fixtures/make-fixtures.ts --large` to create the 100k fixture");
   const results: Record<string, number | string> = {};
   const { url } = openLocal(s.large!);
+  // PERF_CPU_THROTTLE=4 slows this machine's CPU down to roughly a shared CI runner's.
+  const throttle = Number(process.env.PERF_CPU_THROTTLE ?? 0);
+  if (throttle > 1) await (await context.newCDPSession(page)).send("Emulation.setCPUThrottlingRate", { rate: throttle });
 
   // Time to first visible commits / first usable graph (keyboard navigation works).
   const t0 = Date.now();
@@ -44,6 +47,7 @@ test("100k-commit history stays fast and responsive", async ({ page, context }) 
   results.domRows = await page.locator('[role="row"][data-row]').count();
 
   // Scroll frame rate while more history streams in.
+  const prof = await context.newCDPSession(page); await prof.send("Profiler.enable"); await prof.send("Profiler.setSamplingInterval", { interval: 200 }); await prof.send("Profiler.start");
   const scroll = await page.evaluate(async () => {
     const el = document.querySelector(".graph-scroll") as HTMLElement;
     const frames: number[] = [];
@@ -63,6 +67,7 @@ test("100k-commit history stays fast and responsive", async ({ page, context }) 
     frames.sort((a, b) => a - b);
     return { avgFps: frames.length / 3, p95FrameMs: frames[Math.floor(frames.length * 0.95)]!, rowsLoaded: document.querySelectorAll('[role="row"][data-row]').length };
   });
+  const { profile } = await prof.send("Profiler.stop"); writeFileSync(process.env.PROFILE_OUT ?? "/tmp/prof.json", JSON.stringify(profile));
   results.scrollAvgFps = Math.round(scroll.avgFps);
   results.scrollP95FrameMs = Math.round(scroll.p95FrameMs);
 
