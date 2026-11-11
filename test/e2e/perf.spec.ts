@@ -47,6 +47,14 @@ test("100k-commit history stays fast and responsive", async ({ page, context }) 
   results.domRows = await page.locator('[role="row"][data-row]').count();
 
   // Scroll frame rate while more history streams in.
+  // PERF_PROFILE_OUT=<file>: also save a CPU profile of this scroll (open it in Chrome DevTools).
+  const profileOut = process.env.PERF_PROFILE_OUT;
+  const profiler = profileOut ? await context.newCDPSession(page) : null;
+  if (profiler) {
+    await profiler.send("Profiler.enable");
+    await profiler.send("Profiler.setSamplingInterval", { interval: 200 });
+    await profiler.send("Profiler.start");
+  }
   const scroll = await page.evaluate(async () => {
     const el = document.querySelector(".graph-scroll") as HTMLElement;
     const frames: number[] = [];
@@ -66,6 +74,7 @@ test("100k-commit history stays fast and responsive", async ({ page, context }) 
     frames.sort((a, b) => a - b);
     return { avgFps: frames.length / 3, p95FrameMs: frames[Math.floor(frames.length * 0.95)]!, rowsLoaded: document.querySelectorAll('[role="row"][data-row]').length };
   });
+  if (profiler && profileOut) writeFileSync(profileOut, JSON.stringify((await profiler.send("Profiler.stop")).profile));
   results.scrollAvgFps = Math.round(scroll.avgFps);
   results.scrollP95FrameMs = Math.round(scroll.p95FrameMs);
 
