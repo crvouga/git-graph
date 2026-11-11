@@ -18,6 +18,7 @@ export interface LocalReposOptions {
 export class LocalRepos implements RepositoryResolver {
   private readonly adapters = new Map<string, Promise<CliGitAdapter>>();
   private readonly opts: LocalReposOptions;
+  private readonly openedListeners = new Set<(info: RepoInfo) => void>();
   readonly dir: string;
 
   constructor(opts: LocalReposOptions = {}) {
@@ -28,11 +29,19 @@ export class LocalRepos implements RepositoryResolver {
   /** Register a path (any directory inside a worktree) and return its RepoInfo. */
   async open(path: string): Promise<RepoInfo> {
     const loc = await locateRepository(path);
-    const id = repoIdFor(loc.toplevel);
+    const id = repoIdFor(readConfig(this.dir).installId, loc.toplevel);
     rememberRepo(id, { path: loc.toplevel, commonDir: loc.commonDir, name: basename(loc.toplevel) }, this.dir);
     const key = `local:${id}`;
     if (!this.adapters.has(key)) this.adapters.set(key, Promise.resolve(new CliGitAdapter(id, loc, this.opts.hooks?.(key))));
-    return (await this.adapters.get(key)!).info();
+    const info = await (await this.adapters.get(key)!).info();
+    for (const fn of this.openedListeners) fn(info);
+    return info;
+  }
+
+  /** Called after every successful open (HTTP, MCP, CLI or a queued operation). */
+  onOpened(fn: (info: RepoInfo) => void): () => void {
+    this.openedListeners.add(fn);
+    return () => this.openedListeners.delete(fn);
   }
 
   async resolve(key: string): Promise<RepositoryPort> {

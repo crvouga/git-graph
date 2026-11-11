@@ -3,9 +3,12 @@
 import { expect, test } from "@playwright/test";
 import { mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
-import { git, state } from "./harness.ts";
+import { AUTH_STATE, git, state } from "./harness.ts";
 import { makeBasic, makePacked } from "../fixtures/make-fixtures.ts";
 import { MOD, palette, row, waitForGraph } from "./util.ts";
+
+// Local repositories (and browser-opened folders) sync through the signed-in account.
+test.use({ storageState: AUTH_STATE });
 
 function walk(dir: string, out: string[] = []): string[] {
   for (const e of readdirSync(dir)) {

@@ -47,6 +47,7 @@
   "dependencies": {
     "@hono/node-server": "^2.1.6",
     "@modelcontextprotocol/sdk": "^1.32.2",
+    "@rocicorp/zero": "1.11.4",
     "fflate": "^0.8.3",
     "hono": "^4.13.17",
     "openid-client": "^6.8.9",

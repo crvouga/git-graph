@@ -21,8 +21,15 @@ else if (!config.githubClientId || !config.githubClientSecret) warn("GITHUB_CLIE
 if (!config.webhookSecret) warn("GITHUB_WEBHOOK_SECRET not set: webhooks disabled, real-time sync relies on polling");
 if (!config.production && !process.env.SESSION_SECRET) warn("SESSION_SECRET not set: using an ephemeral secret (sessions do not survive restarts)");
 
+if (!config.zero) warn("DATABASE_URL not set: Zero sync is off and the web client cannot show repositories");
+
 const http = serve({ fetch: server.app.fetch, port: config.port, hostname: config.host }, (info) => {
   console.log(JSON.stringify({ t: new Date().toISOString(), level: "info", msg: "lanes server listening", port: info.port, origin: config.appOrigin, staticDir: config.staticDir, epoch: server.hub.epoch }));
+  // zero-cache needs the migrated schema (its publication) before it starts replicating.
+  void server.ready().then(() => server.startZero(info.port));
+});
+http.on("upgrade", (req, socket, head) => {
+  if (!server.upgrade(req, socket, head)) socket.destroy();
 });
 
 let stopping = false;

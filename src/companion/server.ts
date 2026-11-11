@@ -7,6 +7,10 @@
 //     "Authorization: Bearer <token>" (32 random bytes, stored in the 0600 config file)
 //   - Browsers obtain the token by exchanging a one-time pairing code (120 s TTL, single use,
 //     rate limited). Codes are created by the CLI through the authenticated POST /pair/code.
+//
+// When the config holds a hosted-server registration (`git-graph pair`), the companion also runs
+// as a Zero source agent for that server (./agent.ts). GET /agent shows its state and
+// POST /agent/reload restarts it from the current config.
 
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { Hono, type Context } from "hono";
@@ -19,6 +23,7 @@ import { DEFAULT_ALLOWED_ORIGINS, DEFAULT_APP_ORIGIN, DEFAULT_PORT, configDir as
 import { createLocalRuntime, type LocalRuntime } from "./runtime.ts";
 import { gitVersion } from "./exec.ts";
 import type { WatchOptions } from "./watch.ts";
+import { startCompanionAgent, type AgentLog, type AgentStatus, type CompanionAgent } from "./agent.ts";
 
 export const COMPANION_VERSION = "0.1.0";
 export const PAIR_TTL_MS = 120_000;
@@ -34,6 +39,9 @@ export interface CompanionOptions {
   watch?: WatchOptions;
   pairRateLimit?: { max: number; windowMs: number };
   now?: () => number;
+  /** Run as a Zero source agent when the config has a server registration. Default false. */
+  agent?: boolean;
+  log?: AgentLog;
 }
 
 export interface Companion {
@@ -42,6 +50,9 @@ export interface Companion {
   allowedOrigins: Set<string>;
   token: () => string;
   createPairingCode(): { code: string; expiresAt: number };
+  /** (Re)start the source agent from the current config. Null when not configured or disabled. */
+  reloadAgent(): AgentStatus | null;
+  agentStatus(): AgentStatus | null;
   listen(port?: number): Promise<{ port: number; url: string; close: () => Promise<void> }>;
   close(): void;
 }
@@ -99,6 +110,17 @@ export function createCompanion(opts: CompanionOptions = {}): Companion {
   const codes = new Map<string, number>();
   const pairAttempts: number[] = [];
   const limit = opts.pairRateLimit ?? { max: 10, windowMs: 60_000 };
+  const log: AgentLog = opts.log ?? ((level, msg) => (level === "info" ? console.error(msg) : console.error(`${level}: ${msg}`)));
+  let agent: CompanionAgent | null = null;
+  const reloadAgent = (): AgentStatus | null => {
+    agent?.stop();
+    agent = null;
+    if (!opts.agent) return null;
+    const server = readConfig(dir).server;
+    if (!server) return null;
+    agent = startCompanionAgent(runtime, server, log);
+    return agent.status();
+  };
 
   const createPairingCode = () => {
     for (const [k, exp] of codes) if (exp <= now()) codes.delete(k);
@@ -181,6 +203,9 @@ export function createCompanion(opts: CompanionOptions = {}): Companion {
     await next();
   });
 
+  app.get("/agent", (c) => c.json({ enabled: !!opts.agent, status: agent?.status() ?? null }));
+  app.post("/agent/reload", (c) => c.json({ enabled: !!opts.agent, status: reloadAgent() }));
+
   app.post("/pair/code", (c) => {
     const { code, expiresAt } = createPairingCode();
     return c.json({ code, expiresAt, ttlSeconds: PAIR_TTL_MS / 1000 });
@@ -207,6 +232,8 @@ export function createCompanion(opts: CompanionOptions = {}): Companion {
     allowedOrigins: allowed,
     token: () => token,
     createPairingCode,
+    reloadAgent,
+    agentStatus: () => agent?.status() ?? null,
     async listen(port = opts.port ?? DEFAULT_PORT) {
       return new Promise((resolveListen, reject) => {
         const server = serve({ fetch: app.fetch, port, hostname: "127.0.0.1" }, (info: AddressInfo) => {
@@ -216,6 +243,7 @@ export function createCompanion(opts: CompanionOptions = {}): Companion {
             url: `http://127.0.0.1:${actual}`,
             close: () =>
               new Promise<void>((res) => {
+                agent?.stop();
                 runtime.close();
                 server.close(() => res());
                 (server as unknown as { closeAllConnections?: () => void }).closeAllConnections?.();
@@ -226,6 +254,7 @@ export function createCompanion(opts: CompanionOptions = {}): Companion {
       });
     },
     close() {
+      agent?.stop();
       runtime.close();
     },
   };
@@ -233,7 +262,10 @@ export function createCompanion(opts: CompanionOptions = {}): Companion {
 
 /** Run the companion in the foreground (used by `git-graph serve` and dist/companion/companion.mjs). */
 export async function serveCompanion(opts: CompanionOptions & { quiet?: boolean } = {}) {
-  const companion = createCompanion(opts);
+  const log: AgentLog = opts.log ?? ((level, msg) => {
+    if (level !== "info" || !opts.quiet) console.error(level === "info" ? msg : `${level}: ${msg}`);
+  });
+  const companion = createCompanion({ agent: true, ...opts, log });
   const dir = opts.configDir ?? defaultConfigDir();
   const v = await gitVersion();
   if (!v.ok && !opts.quiet) console.error(`warning: ${v.problem}`);
@@ -246,6 +278,7 @@ export async function serveCompanion(opts: CompanionOptions & { quiet?: boolean 
     console.error(`Lanes companion listening on ${l.url} (git ${v.version.join(".")})`);
     console.error(`Allowed origins: ${[...companion.allowedOrigins].join(", ")}`);
   }
+  if (!companion.reloadAgent() && !opts.quiet) console.error("Not paired with a Lanes server: run `git-graph pair` to see local repositories in the web app.");
   const stop = () => {
     void l.close().then(() => process.exit(0));
     setTimeout(() => process.exit(0), 1500).unref();

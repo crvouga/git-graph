@@ -3,8 +3,11 @@ import { expect, test } from "@playwright/test";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
-import { git, openLocal, ROOT, state } from "./harness.ts";
+import { AUTH_STATE, git, openLocal, ROOT, state } from "./harness.ts";
 import { MOD } from "./util.ts";
+
+// Local repositories (and browser-opened folders) sync through the signed-in account.
+test.use({ storageState: AUTH_STATE });
 
 const BUDGET = {
   firstVisibleCommitsMs: 1500,
@@ -25,12 +28,18 @@ test("100k-commit history stays fast and responsive", async ({ page, context }) 
 
   // Time to first visible commits / first usable graph (keyboard navigation works).
   const t0 = Date.now();
-  await page.goto(url);
-  await expect(page.locator('[role="row"][data-row="0"]')).toBeVisible({ timeout: 10_000 });
+  // Checked every frame: expect() polls with growing gaps (up to 1 s), which would round the result up.
+  const shown = (sel: string) => page.waitForFunction((s) => !!(document.querySelector(s) as HTMLElement | null)?.offsetParent, sel, { polling: "raf", timeout: 10_000 });
+  await page.goto(url, { waitUntil: "commit" });
+  await shown('[role="row"][data-row="0"]');
   results.firstVisibleCommitsMs = Date.now() - t0;
+  // Where the first load spent its time (ms since navigation start).
+  results.firstLoadMarks = JSON.stringify(
+    await page.evaluate(() => Object.fromEntries(performance.getEntriesByType("mark").filter((m) => m.name.startsWith("lanes:")).map((m) => [m.name.slice(6), Math.round(m.startTime)]))),
+  );
   await page.getByRole("grid").focus();
   await page.keyboard.press("ArrowDown");
-  await expect(page.locator('[role="row"][data-row="1"].kb')).toBeVisible();
+  await shown('[role="row"][data-row="1"].kb');
   results.firstUsableGraphMs = Date.now() - t0;
   results.domRows = await page.locator('[role="row"][data-row]').count();
 

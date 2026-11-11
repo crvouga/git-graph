@@ -5,7 +5,9 @@
 //   openHome()                                                       // no repository
 //
 // The fixture repository (scripts/storybook-fixture.ts) is copied into the browser's private file
-// system and opened through the in-browser git reader, exactly like "Open Folder…" in the app.
+// system and opened through the in-browser git reader, exactly like "Open Folder…" in the app: the
+// tab's agent publishes it into Zero (offline in Storybook, so the local store is the database) and
+// the UI reads it back through the same queries as in production.
 
 import fixture from "virtual:lanes-fixture-repo";
 import type { JSX } from "solid-js";
@@ -122,7 +124,7 @@ export async function openFixture(patch: ViewPatch = {}, opts: { repo?: RepoRef 
   resetUi();
   app.navigate(view({}), { replace: true });
   app.navigate(view({ repo: opts.repo ?? FIXTURE_REPO, ...patch }), { replace: true });
-  await until(() => !app.repo.loading && (app.readySession() === app.sessionId() || !!app.repo.error), "the repository to open");
+  await until(() => (app.rows.complete && !!app.repo.refs?.version) || !!app.repo.error, "the repository to open");
 }
 
 /** Fills the story canvas; the app lays itself out in a full-height column. */
@@ -138,9 +140,9 @@ export function rowOf(hash: string): number {
 }
 
 /**
- * Stops the engine from pushing updates for the open repository (polling, sync status), so a story
- * can pin store state such as `app.setRepo("sync", …)` without it being overwritten. The graph stays.
+ * Lets pending updates settle so a story can pin store state such as `app.setRepo("sync", …)`.
+ * Storybook's Zero is offline: nothing changes the repository afterwards, so pinned state stays.
  */
 export async function freezeEngine(): Promise<void> {
-  await app.engine.call({ method: "close", args: { session: app.sessionId() } });
+  await new Promise((r) => setTimeout(r, 50));
 }

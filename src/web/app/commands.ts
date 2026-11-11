@@ -1,8 +1,9 @@
 // The UI's view of the single command registry.
 //  - Repo commands (queries/mutations) come from core/commands/repo-commands.ts unchanged; the UI
-//    never re-implements them: mutations are executed by the host that owns the adapter (hosted
-//    server or local companion) through /api/v1/commands/execute, which enforces validation,
-//    capabilities and the destructive-confirmation policy.
+//    never re-implements them: a mutation is queued through Zero (an `operations` row) and run by
+//    the agent that serves the repository (the server for GitHub, the companion for local
+//    repositories, this tab for opened folders), which enforces validation, capabilities and the
+//    destructive-confirmation policy.
 //  - UI commands (navigation, view, palette…) are registered in the same registry.
 //  - Binders map the current context (focused commit / ref / file / hunk) to command arguments and
 //    describe which arguments still need to be asked for.
@@ -17,6 +18,10 @@ import { app, DEFAULT_COLUMNS, type DialogField, type MenuItem } from "./store.t
 import type { RowCommit } from "../engine/protocol.ts";
 import { isReserved } from "./platform.ts";
 import { fsAccessSupported, newHandleId, saveHandle } from "./handles.ts";
+import { readOnce, runOperation } from "./sync.ts";
+import type { ReadMethod } from "../../zero/mutators.ts";
+import { mutators } from "../../zero/mutators.ts";
+import { boot, mutate } from "./zero.ts";
 
 export interface UiContext {
   commit: RowCommit | null;
@@ -437,33 +442,36 @@ export function splitArgs(s: string): string[] {
 // Engine helpers
 // ---------------------------------------------------------------------------
 
-export function portCall<T>(name: string, params: unknown[], signal?: AbortSignal): Promise<T> {
-  return app.engine.call<T>({ method: "port", args: { session: app.sessionId(), name, params } }, signal);
+/** A repository read through Zero (cached for everyone who can see the repository). */
+export function portCall<T>(name: string, params: unknown[]): Promise<T> {
+  const repoId = app.repoId();
+  if (!repoId) return Promise.reject(new AppError("BAD_REQUEST", "Open a repository first"));
+  const live = name === "status" || name === "worktrees" || name === "remotes" || name === "conflict" || (name === "diff" && (params[0] as { kind?: string })?.kind === "working");
+  return readOnce<T>({ repoId, method: name as ReadMethod, params, live });
 }
 
-/** Run a repository mutation on the owning host, with the confirmation round-trip. */
-export async function executeRemote(command: string, args: Record<string, unknown>, title: string): Promise<MutationResult | null> {
-  let confirm: string | undefined;
-  for (let attempt = 0; attempt < 2; attempt++) {
-    app.setBusy(title);
-    try {
-      const result = await app.engine.call<MutationResult>({ method: "execute", args: { session: app.sessionId(), command, params: args, confirm } });
-      return result;
-    } catch (e) {
-      const err = AppError.from(e);
-      if (err.code === "CONFIRMATION_REQUIRED" && !confirm) {
+/** The companion that runs repository-less commands (open, clone, init): the most recent one online. */
+export function onlineCompanion(): string | null {
+  return app.companions().find((c) => c.online)?.id ?? null;
+}
+
+/** Queue a repository mutation for its agent, with the confirmation round-trip. */
+export async function executeRemote(command: string, args: Record<string, unknown>, title: string, target: { repoId?: string | null; agentId?: string | null } = {}): Promise<MutationResult | null> {
+  if (!boot.accountId) throw new AppError("UNAUTHENTICATED", "Sign in to change repositories");
+  app.setBusy(title);
+  try {
+    return await runOperation(
+      { repoId: target.repoId === undefined ? app.repoId() : target.repoId, agentId: target.agentId ?? null, command, args, title },
+      async (consequence) => {
         app.setBusy(null);
-        const ok = await app.ask({ title, consequence: String(err.details?.consequence ?? err.message), confirmLabel: "Yes, continue", danger: true });
-        if (!ok) return null;
-        confirm = String(err.details?.confirmToken ?? "");
-        continue;
-      }
-      throw err;
-    } finally {
-      app.setBusy(null);
-    }
+        const ok = await app.ask({ title, consequence, confirmLabel: "Yes, continue", danger: true });
+        if (ok) app.setBusy(title);
+        return !!ok;
+      },
+    );
+  } finally {
+    app.setBusy(null);
   }
-  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -508,32 +516,23 @@ async function openFolder() {
   }
 }
 
-/** Run a companion-level command (no repository session needed) and open the resulting repository. */
-async function companionCommand(command: string, args: Record<string, unknown>, busy: string) {
-  const c = app.companion();
-  app.setBusy(busy);
+/** Run a companion-level command (no repository behind it) on the companion, then open the result. */
+export async function companionCommand(command: string, args: Record<string, unknown>, busy: string) {
+  const agentId = onlineCompanion();
+  if (!agentId) return app.toast("error", `${busy} failed`, "No companion is online. Run `git-graph serve` (or `git-graph open .`) on your computer.");
   try {
-    const res = await fetch(`${c.baseUrl}/api/v1/commands/execute`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${c.token}`, "x-client": "ui" },
-      body: JSON.stringify({ command, args }),
-    });
-    const body = (await res.json()) as { ok: boolean; result?: RepoInfo; error?: { message: string } };
-    if (!body.ok || !body.result) throw new Error(body.error?.message ?? `HTTP ${res.status}`);
-    const info = body.result;
+    const info = (await executeRemote(command, args, busy, { repoId: null, agentId })) as unknown as RepoInfo | null;
+    if (!info?.key) return;
     app.rememberRecent({ key: info.key, name: info.name, path: info.worktreePath, at: Date.now() });
     app.navigate({ ...app.view(), repo: { provider: "local", id: info.key.split(":")[1]! }, branches: [], commit: null, compare: null, selected: [], view: "graph", file: null, at: null, worktree: null });
   } catch (e) {
-    app.toast("error", `${busy} failed`, e instanceof Error ? e.message : String(e));
-  } finally {
-    app.setBusy(null);
+    app.toast("error", `${busy} failed`, AppError.from(e).message);
   }
 }
 
 export async function openWorktreePath(path: string) {
   try {
-    const info = await executeRemote("local.open", { path }, `Open ${path}`);
-    const ri = info as unknown as RepoInfo | null;
+    const ri = (await executeRemote("local.open", { path }, `Open ${path}`, { repoId: null, agentId: onlineCompanion() })) as unknown as RepoInfo | null;
     if (ri?.key) {
       const id = ri.key.split(":")[1]!;
       app.rememberRecent({ key: ri.key, name: ri.name, path: ri.worktreePath, at: Date.now() });
@@ -581,14 +580,17 @@ function uiCommands(): UiCommand[] {
     }),
     ui({ id: "menu.context", title: "Show Context Menu", description: "Actions for the focused commit, ref, file or hunk.", category: "View", shortcuts: ["Shift+F10", "ContextMenu"], scope: "global", execute: () => openContextMenuForFocus() }),
     ui({ id: "tooltip.show", title: "Show Commit Info", description: "Show the tooltip for the focused commit.", category: "View", shortcuts: ["i"], when: hasRows, execute: () => toggleTooltip() }),
-    ui({ id: "graph.refresh", title: "Refresh", description: "Reconcile with the repository now (normally automatic).", category: "Repository", shortcuts: ["r"], when: hasRepo, execute: () => app.engine.call({ method: "refresh", args: { session: app.sessionId(), reason: "manual", force: true } }) }),
+    ui({ id: "graph.refresh", title: "Refresh", description: "Reconcile with the repository now (normally automatic).", category: "Repository", shortcuts: ["r"], when: hasRepo, execute: () => {
+      const id = app.repoId();
+      if (id) mutate(mutators.repo.open({ repoId: id, depth: 1, now: Date.now() }));
+    } }),
     ui({ id: "repo.open", title: "Open Repository…", description: "Open a GitHub repository, a recent repository or a local folder.", category: "Repository", shortcuts: ["o"], scope: "graph", execute: () => app.setPaletteOpen({ mode: "repos" }) }),
     ui({
       id: "repo.clone",
       title: "Clone Repository…",
       description: "Clone a repository with the local git-graph companion and open it.",
       category: "Repository",
-      when: () => (app.companion().token ? { enabled: true } : { enabled: false, reason: "Connect the local companion first" }),
+      when: () => (onlineCompanion() ? { enabled: true } : { enabled: false, reason: "No companion is online: run `git-graph serve` on your computer" }),
       execute: async () => {
         const v = await app.ask({
           title: "Clone repository",
@@ -606,7 +608,7 @@ function uiCommands(): UiCommand[] {
       title: "Initialize Repository…",
       description: "Create a new Git repository with the local companion and open it.",
       category: "Repository",
-      when: () => (app.companion().token ? { enabled: true } : { enabled: false, reason: "Connect the local companion first" }),
+      when: () => (onlineCompanion() ? { enabled: true } : { enabled: false, reason: "No companion is online: run `git-graph serve` on your computer" }),
       execute: async () => {
         const v = await app.ask({
           title: "Initialize repository",
@@ -676,7 +678,6 @@ function uiCommands(): UiCommand[] {
     ui({ id: "worktree.switch", title: "Switch Worktree…", description: "Pick a linked worktree to open.", category: "Worktree", shortcuts: ["w"], capability: "worktrees", execute: () => app.setPaletteOpen({ mode: "worktrees" }) }),
     ui({ id: "rebase.interactive", title: "Interactive Rebase from Here…", description: "Edit the commits after the focused commit (pick, reword, squash, fixup, drop).", category: "Branch", contexts: ["commit"], capability: "interactiveRebase", execute: () => void interactiveRebase() }),
     ui({ id: "companion.connect", title: "Connect Local Companion…", description: "Pair with `git-graph serve` running on this computer.", category: "Account", execute: () => void connectCompanion() }),
-    ui({ id: "companion.disconnect", title: "Disconnect Local Companion", description: "Forget the companion token in this browser.", category: "Account", when: () => (app.companion().token ? { enabled: true } : { enabled: false, reason: "Not connected" }), execute: () => app.setCompanion({ ...app.companion(), token: null }) }),
     ui({
       id: "account.signIn",
       title: "Sign In",
@@ -716,14 +717,12 @@ function uiCommands(): UiCommand[] {
     ui({
       id: "account.disconnectGitHub",
       title: "Disconnect GitHub",
-      description: "Unlink your GitHub account from Lanes; private repositories stop loading.",
+      description: "Unlink your GitHub account from Lanes; private repositories are no longer shown.",
       category: "Account",
       scope: "global",
       when: () => (app.auth.github?.connected ? { enabled: true } : { enabled: false, reason: "GitHub is not connected" }),
       execute: async () => {
         await fetch("/auth/github/disconnect", { method: "POST", credentials: "include", headers: { "content-type": "application/json" } }).catch(() => {});
-        await app.checkSession();
-        void app.openRepo(app.view());
       },
     }),
     ui({
@@ -735,8 +734,8 @@ function uiCommands(): UiCommand[] {
       when: () => (app.auth.authenticated ? { enabled: true } : { enabled: false, reason: "Not signed in" }),
       execute: async () => {
         await fetch("/auth/logout", { method: "POST", credentials: "include", headers: { "content-type": "application/json" } }).catch(() => {});
-        await app.checkSession();
-        void app.openRepo(app.view());
+        // A different person (nobody) now: start over with a fresh Zero client.
+        location.reload();
       },
     }),
     ui({ id: "metrics.show", title: "Show Performance Metrics", description: "Measured timings for this session.", category: "Help", execute: () => void app.ask({ title: "Performance metrics", output: { text: JSON.stringify(app.metrics, null, 2) }, confirmLabel: "Close" }) }),
@@ -802,16 +801,17 @@ export function openGitHubInput(input: string) {
 }
 
 async function connectCompanion() {
+  if (!boot.accountId) return app.toast("info", "Sign in first", "The companion syncs your local repositories to your account.", { label: "Sign in", run: () => (location.href = app.loginUrl()) });
   const v = await app.ask({
     title: "Connect local companion",
-    message: "Run `git-graph pair` (or `git-graph open .`) in a terminal, then paste the one-time code.",
-    fields: [
-      { name: "url", label: "Companion address", type: "text", value: app.companion().baseUrl },
-      { name: "code", label: "Pairing code", type: "text", required: true },
-    ],
+    message: "Run `git-graph pair` in a terminal on your computer. It opens this app with the code; or paste the code here.",
+    fields: [{ name: "code", label: "Pairing code", type: "text", required: true }],
     confirmLabel: "Connect",
   });
-  if (v && (await app.pairCompanion(String(v.code).trim(), String(v.url).replace(/\/+$/, "")))) void app.openRepo(app.view());
+  if (!v) return;
+  const r = await mutate(mutators.agent.claim({ code: String(v.code).trim(), now: Date.now() })).server;
+  if (r.type === "error") app.toast("error", "Could not connect the companion", r.error?.message);
+  else app.toast("success", "Companion connected: your local repositories sync to this account");
 }
 
 async function interactiveRebase() {
@@ -882,7 +882,7 @@ export function commandAvailability(cmd: AnyCommand, ctx: UiContext): { enabled:
     if (!b) return { enabled: false, reason: "Not available from the UI" };
     if (!app.view().repo) return { enabled: false, reason: "Open a repository first" };
     const caps = app.repo.caps;
-    if (!caps) return { enabled: false, reason: "Repository is still loading" };
+    if (!caps) return { enabled: false, reason: "The repository has not been published by its agent yet" };
     if (cmd.capability && !caps[cmd.capability].available) return { enabled: false, reason: (caps[cmd.capability] as { reason: string }).reason };
     const args = b.bind(ctx);
     if (typeof args === "string") return { enabled: false, reason: args };

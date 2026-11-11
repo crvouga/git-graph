@@ -2,7 +2,8 @@
 // and docs/deploy.md.
 
 import { randomBytes } from "node:crypto";
-import { resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { withVaultAliases } from "./vault-keys.ts";
 
 export interface RateLimitConfig {
@@ -43,9 +44,11 @@ export interface ServerConfig {
   oidc: { issuer: string; clientId: string; redirectUri: string; scopes: string; idpHint: string } | null;
   /** Opaque PostgreSQL connection URL (Vault DATABASE_URL). Never logged. */
   databaseUrl: string | null;
-  /** Lanes' allocated schema. */
+  /** Lanes' allocated schema (never `public` or a PostgreSQL system schema). */
   databaseSchema: string;
   databasePoolMax: number;
+  /** Queries pipelined per connection (tests set 1: PGlite's socket server answers one at a time). */
+  databaseMaxPipeline?: number;
   migrateOnBoot: boolean;
   /** Encrypts GitHub tokens stored in PostgreSQL (≥ 32 bytes). */
   tokenEncryptionKey: string | null;
@@ -61,13 +64,48 @@ export interface ServerConfig {
   coalesceMs: number;
   /** SSE heartbeat. */
   heartbeatMs: number;
+  /** Zero sync (enabled with DATABASE_URL): the web client reads everything through it. */
+  zero: ZeroConfig | null;
   /** Test hook: fetch used for GitHub calls. */
   fetch?: typeof fetch;
   /** Log function (defaults to console.log with JSON lines). Never receives tokens. */
   log?: (level: "info" | "warn" | "error", msg: string, extra?: Record<string, unknown>) => void;
 }
 
+export interface ZeroConfig {
+  /** Internal URL of an external zero-cache (the production sidecar); null = run it as a child process. */
+  cacheUrl: string | null;
+  /** Port of the embedded zero-cache (loopback only; browsers reach it through /zero). */
+  port: number;
+  /** Direct (unpooled) PostgreSQL URL zero-cache replicates from. Never logged. */
+  upstreamDb: string;
+  cvrDb: string | null;
+  changeDb: string | null;
+  /** zero-cache app id: names its PostgreSQL schemas (<appId>, <appId>_0, <appId>_0/cdc, <appId>_0/cvr). */
+  appId: string;
+  /** Shared secret zero-cache sends to /internal/zero/* (X-Api-Key). Required with cacheUrl. */
+  apiKey: string;
+  adminPassword: string;
+  /** SQLite replica (a disposable cache: rebuilt from PostgreSQL when missing). */
+  replicaFile: string;
+  logLevel: string;
+  numSyncWorkers: number | null;
+}
+
 const DEFAULT_POLLER: PollerConfig = { fastMs: 15_000, coveredMs: 60_000, maxMs: 5 * 60_000, coverageWindowMs: 30 * 60_000, jitter: 0.2 };
+
+/** Schemas that are shared with other apps or owned by PostgreSQL itself. */
+const RESERVED_SCHEMAS = new Set(["public", "information_schema", "pg_catalog", "pg_toast"]);
+const SCHEMA_IDENT = /^[a-z_][a-z0-9_]{0,62}$/;
+
+/** A dedicated PostgreSQL schema: a lowercase identifier that is not a system or shared schema. */
+function schemaName(value: string, variable: string): string {
+  if (!SCHEMA_IDENT.test(value)) throw new Error(`${variable} must be a lowercase PostgreSQL identifier (a-z, 0-9, _, not starting with a digit), got "${value}"`);
+  if (RESERVED_SCHEMAS.has(value) || value.startsWith("pg_")) {
+    throw new Error(`${variable} must not be a system or shared schema ("${value}"); use a dedicated schema such as "lanes"`);
+  }
+  return value;
+}
 
 function num(v: string | undefined, d: number): number {
   const n = Number(v);
@@ -78,6 +116,9 @@ export function loadConfig(rawEnv: NodeJS.ProcessEnv = process.env): ServerConfi
   const env = withVaultAliases(rawEnv);
   const production = env.NODE_ENV === "production";
   const port = num(env.PORT, 8787);
+  const databaseUrl = env.DATABASE_URL || null;
+  // Lanes may only write inside its own allocated schema. Never `public` or a PostgreSQL schema.
+  const databaseSchema = schemaName(env.DATABASE_SCHEMA || "lanes", "DATABASE_SCHEMA");
   if (production && !env.APP_ORIGIN) throw new Error("APP_ORIGIN must be set in production (the public origin, e.g. https://lanes.chrisvouga.dev)");
   const appOrigin = (env.APP_ORIGIN || `http://localhost:${port}`).replace(/\/+$/, "");
   try {
@@ -94,12 +135,14 @@ export function loadConfig(rawEnv: NodeJS.ProcessEnv = process.env): ServerConfi
   // Each integration needs all of its parts; a deploy with only some is broken, not "anonymous".
   const groups: [string, string[]][] = [
     ["GitHub App", ["GITHUB_CLIENT_ID", "GITHUB_CLIENT_SECRET"]],
-    ["auth relay sign-in", ["OIDC_ISSUER", "OIDC_CLIENT_ID", "DATABASE_URL", "TOKEN_ENCRYPTION_KEY"]],
+    ["auth relay sign-in", ["OIDC_ISSUER", "OIDC_CLIENT_ID", "TOKEN_ENCRYPTION_KEY"]],
   ];
   for (const [what, keys] of groups) {
     const set = keys.filter((k) => env[k]);
     if (set.length && set.length < keys.length) throw new Error(`${keys.filter((k) => !env[k]).join(", ")} missing: ${what} needs ${keys.join(", ")}`);
   }
+  // DATABASE_URL alone enables Zero sync (signed-out browsing); sign-in also needs it.
+  if (env.OIDC_ISSUER && !env.DATABASE_URL) throw new Error("DATABASE_URL missing: auth relay sign-in needs OIDC_ISSUER, OIDC_CLIENT_ID, DATABASE_URL, TOKEN_ENCRYPTION_KEY");
   if (env.OIDC_ISSUER && !env.GITHUB_CLIENT_ID) throw new Error("GITHUB_CLIENT_ID, GITHUB_CLIENT_SECRET missing: connecting GitHub needs the GitHub App");
   if (env.TOKEN_ENCRYPTION_KEY && Buffer.byteLength(env.TOKEN_ENCRYPTION_KEY) < 32) throw new Error("TOKEN_ENCRYPTION_KEY (Vault LANES_TOKEN_ENCRYPTION_KEY) must be at least 32 bytes");
   if (production && !/^(1|true|yes)$/i.test(env.ALLOW_ANONYMOUS_ONLY ?? "")) {
@@ -108,6 +151,41 @@ export function loadConfig(rawEnv: NodeJS.ProcessEnv = process.env): ServerConfi
   }
   const tp = (env.TRUST_PROXY ?? "").trim().toLowerCase();
   const trustProxy = tp === "true" || tp === "yes" ? 1 : tp === "false" || tp === "" ? 0 : Math.max(0, Math.floor(num(tp, 0)));
+
+  const zeroEnabled = !!databaseUrl && !/^(0|false|no)$/i.test(env.ZERO ?? "");
+  let zero: ZeroConfig | null = null;
+  if (zeroEnabled) {
+    const cacheUrl = (env.ZERO_CACHE_URL || "").replace(/\/+$/, "") || null;
+    if (cacheUrl) {
+      let parsed: URL;
+      try {
+        parsed = new URL(cacheUrl);
+      } catch {
+        throw new Error(`ZERO_CACHE_URL must be an http(s) URL (got "${cacheUrl}")`);
+      }
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error(`ZERO_CACHE_URL must be an http(s) URL (got "${cacheUrl}")`);
+      // An external zero-cache must know the same key; a random per-boot key would break it.
+      if (!env.ZERO_API_KEY) throw new Error("ZERO_API_KEY must be set when ZERO_CACHE_URL points at an external zero-cache (the server and the sidecar must share it)");
+    }
+    if (env.ZERO_API_KEY && env.ZERO_API_KEY.length < 16) throw new Error("ZERO_API_KEY must be at least 16 characters (openssl rand -base64 32)");
+    const appId = schemaName(env.ZERO_APP_ID || "lanes_zero", "ZERO_APP_ID");
+    const zeroSchemas = new Set([appId, `${appId}_0`, `${appId}_0/cdc`, `${appId}_0/cvr`]);
+    if (zeroSchemas.has(databaseSchema)) throw new Error(`ZERO_APP_ID must not collide with DATABASE_SCHEMA ("${databaseSchema}"): zero-cache keeps its own state in <ZERO_APP_ID> schemas`);
+    zero = {
+      cacheUrl,
+      port: num(env.ZERO_PORT, 4848),
+      upstreamDb: env.ZERO_UPSTREAM_DB || databaseUrl!,
+      cvrDb: env.ZERO_CVR_DB || null,
+      changeDb: env.ZERO_CHANGE_DB || null,
+      appId,
+      apiKey: env.ZERO_API_KEY || randomBytes(24).toString("base64url"),
+      adminPassword: env.ZERO_ADMIN_PASSWORD || randomBytes(24).toString("base64url"),
+      replicaFile: env.ZERO_REPLICA_FILE || join(tmpdir(), `lanes-zero-${port}`, "replica.db"),
+      logLevel: env.ZERO_LOG_LEVEL || "warn",
+      numSyncWorkers: env.ZERO_NUM_SYNC_WORKERS ? num(env.ZERO_NUM_SYNC_WORKERS, 1) : null,
+    };
+  }
+
   return {
     port,
     host: env.HOST || "0.0.0.0",
@@ -131,8 +209,8 @@ export function loadConfig(rawEnv: NodeJS.ProcessEnv = process.env): ServerConfi
           idpHint: env.OIDC_IDP_HINT ?? "google",
         }
       : null,
-    databaseUrl: env.DATABASE_URL || null,
-    databaseSchema: env.DATABASE_SCHEMA || "lanes",
+    databaseUrl,
+    databaseSchema,
     databasePoolMax: num(env.DATABASE_POOL_MAX, 5),
     migrateOnBoot: !/^(0|false|no)$/i.test(env.MIGRATE_ON_BOOT ?? ""),
     tokenEncryptionKey: env.TOKEN_ENCRYPTION_KEY || null,
@@ -149,6 +227,7 @@ export function loadConfig(rawEnv: NodeJS.ProcessEnv = process.env): ServerConfi
     },
     coalesceMs: 150,
     heartbeatMs: 15_000,
+    zero,
   };
 }
 

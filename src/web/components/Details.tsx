@@ -1,10 +1,11 @@
 // Commit details / comparison / uncommitted changes, expanded in place under the selected row.
 
-import { createEffect, createMemo, createResource, createSignal, For, Show, on } from "solid-js";
+import { createEffect, createMemo, createSignal, For, Show, on } from "solid-js";
 import { AppError, type CommitDetails, type Diff, type FileChange, type WorkingTreeStatus } from "../../core/types.ts";
 import { WORKING } from "../../core/url/state.ts";
 import { app } from "../app/store.ts";
 import { executeRemote, invokeMutation, openMenu, portCall, BINDERS, type UiContext } from "../app/commands.ts";
+import { useRead } from "../app/sync.ts";
 import { formatDate } from "./GraphView.tsx";
 import { IconClose, IconFile, IconFolder, IconList, IconTree } from "./icons.tsx";
 
@@ -151,21 +152,46 @@ export function Details() {
     { equals: (x, y) => x?.base === y?.base && x?.head === y?.head },
   );
 
-  const [details] = createResource(
-    () => (!isWorking() && !v().compare && v().commit && app.readySession() ? `${app.readySession()}|${v().commit}` : null),
-    async (key) => {
-      const h = key.split("|")[1]!;
-      const full = app.rows.commits[app.rows.index.get(h) ?? -1]?.hash ?? h;
-      return portCall<CommitDetails>("commit", [full]);
+  // The commit row is already synced: show it at once; body and files fill in from the read.
+  const rowCommit = createMemo(() => {
+    app.rowsVersion();
+    const h = v().commit;
+    return h ? (app.rows.commits[app.rows.index.get(h) ?? -1] ?? null) : null;
+  });
+  const detailsRead = useRead<CommitDetails>(() => {
+    const id = app.repoId();
+    const h = rowCommit()?.hash ?? v().commit;
+    return id && h && !isWorking() && !v().compare ? { repoId: id, method: "commit", params: [h] } : null;
+  });
+  const details = Object.assign(
+    (): CommitDetails | undefined => {
+      const d = detailsRead.value();
+      if (d) return d;
+      const c = rowCommit();
+      return c && c.hash !== WORKING ? { hash: c.hash, parents: c.parents, author: c.author, committer: c.committer, subject: c.subject, body: "", files: [] } : undefined;
+    },
+    {
+      get error() {
+        return detailsRead.error();
+      },
     },
   );
-  const [comparison] = createResource(
-    () => (pair() && app.readySession() ? `${app.readySession()}|${pair()!.base}|${pair()!.head}` : null),
-    async (key) => {
-      const [, base, head] = key.split("|");
-      return portCall<Diff>("diff", [{ kind: "compare", base: base!, head: head! }]);
+  // The commit's whole diff, fetched alongside the details so any file opens at once.
+  useRead<Diff>(() => {
+    const id = app.repoId();
+    const h = rowCommit()?.hash;
+    return id && h && h !== WORKING && !v().compare ? { repoId: id, method: "diff", params: [{ kind: "commit", hash: h }] } : null;
+  });
+  const comparisonRead = useRead<Diff>(() => {
+    const id = app.repoId();
+    const p = pair();
+    return id && p ? { repoId: id, method: "diff", params: [{ kind: "compare", base: p.base, head: p.head }] } : null;
+  });
+  const comparison = Object.assign(() => comparisonRead.value(), {
+    get error() {
+      return comparisonRead.error();
     },
-  );
+  });
 
   const files = createMemo<FileEntry[]>(() => {
     if (isWorking()) return app.repo.status ? workingFiles(app.repo.status) : [];
@@ -173,11 +199,17 @@ export function Details() {
     return details()?.files.map((f) => ({ ...f, area: "commit" as const })) ?? [];
   });
 
-  const items = createMemo(() => {
-    if (!isWorking()) return buildTree(files(), collapsed(), treeMode());
-    // Working tree: group by area, each group a flat list (area headers are not focusable).
-    return files().map((f) => ({ key: `${f.area}:${f.path}`, depth: 0, folder: null, file: f, label: f.path }));
-  });
+  // Synced rows arrive as new objects whenever their read is re-delivered (or the view changes);
+  // keep the same items when nothing changed, so <For> keeps the elements and keyboard focus.
+  const items = createMemo(
+    () => {
+      if (!isWorking()) return buildTree(files(), collapsed(), treeMode());
+      // Working tree: group by area, each group a flat list (area headers are not focusable).
+      return files().map((f) => ({ key: `${f.area}:${f.path}`, depth: 0, folder: null, file: f, label: f.path }));
+    },
+    undefined,
+    { equals: (a, b) => a.length === b.length && JSON.stringify(a) === JSON.stringify(b) },
+  );
 
   createEffect(on(() => `${v().commit}|${v().compare}`, () => setActive(0)));
   // Focus moved to the list before files loaded: hand it to the first file once they arrive.
@@ -317,13 +349,15 @@ export function Details() {
           <div>
             Displaying all changes from <b class="select-all">{pair()?.base}</b> to <b class="select-all">{pair()?.head}</b>.
           </div>
-          <div class="mt-2 text-muted">{comparison.loading ? "Loading…" : `${files().length} files changed`}</div>
+          <Show when={comparison()}>
+            <div class="mt-2 text-muted">{`${files().length} files changed`}</div>
+          </Show>
           <Show when={comparison.error}>
             <div class="text-del mt-2">{AppError.from(comparison.error).message}</div>
           </Show>
         </Show>
         <Show when={!isWorking() && !v().compare}>
-          <Show when={details()} fallback={<div class="text-muted">{details.error ? <span class="text-del">{AppError.from(details.error).message}</span> : "Loading…"}</div>}>
+          <Show when={details()} fallback={<Show when={details.error}>{(e) => <div class="text-del">{AppError.from(e()).message}</div>}</Show>}>
             {(d) => (
               <div>
                 <div>
@@ -379,7 +413,7 @@ export function Details() {
           </Show>
         </Show>
       </div>
-      <div class="files" ref={listEl} role="tree" aria-label="Changed files" aria-busy={files().length === 0 && (details.loading || comparison.loading)} tabIndex={-1} onKeyDown={onKey}>
+      <div class="files" ref={listEl} role="tree" aria-label="Changed files" tabIndex={-1} onKeyDown={onKey}>
         <Show when={!isWorking() && files().length}>
           <div class="px-3 pb-1 text-xs text-muted" aria-live="polite">
             Reviewed {reviewedCount()} / {files().length}

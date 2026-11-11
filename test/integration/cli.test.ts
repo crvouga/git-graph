@@ -1,13 +1,14 @@
 // `git-graph` CLI: JSON output, exit codes, confirmation flow, deep links.
 
 import { execFile, execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { ROOT, makeBasic, type BasicFixture } from "../fixtures/make-fixtures.ts";
 import { createCompanion } from "../../src/companion/server.ts";
-import { repoIdFor } from "../../src/companion/config.ts";
+import { readConfig, repoIdFor } from "../../src/companion/config.ts";
 
 const CLI = resolve(import.meta.dirname, "../../src/cli/main.ts");
 
@@ -19,6 +20,40 @@ interface CliResult {
 }
 
 let env: NodeJS.ProcessEnv;
+
+/** Stand-in for the hosted server's companion registration API (/agent-api/v1). */
+function fakeLanesServer() {
+  const state = { paired: false, registrations: 0, codes: 0, token: "agent-token-secret-0123456789" };
+  let url = "";
+  const server: Server = createServer((req, res) => {
+    const json = (status: number, body: unknown) => {
+      res.writeHead(status, { "content-type": "application/json" });
+      res.end(JSON.stringify(body));
+    };
+    const authed = req.headers.authorization === `Bearer ${state.token}`;
+    const code = () => {
+      state.codes++;
+      return { code: `claim-code-${state.codes}`, pairUrl: `${url}/#claim=claim-code-${state.codes}`, expiresAt: Date.now() + 600_000 };
+    };
+    if (req.method === "POST" && req.url === "/agent-api/v1/register") {
+      state.registrations++;
+      return json(200, { agentId: "companion-test", token: state.token, ...code() });
+    }
+    if (!authed) return json(401, { error: { code: "UNAUTHENTICATED", message: "Unknown companion token" } });
+    if (req.method === "GET" && req.url === "/agent-api/v1/me") return json(200, { agentId: "companion-test", name: "t", paired: state.paired, userID: "agent:companion-test", cacheURL: `${url}/zero` });
+    if (req.method === "POST" && req.url === "/agent-api/v1/pair") {
+      state.paired = false;
+      return json(200, { agentId: "companion-test", ...code() });
+    }
+    json(404, { error: { code: "NOT_FOUND", message: req.url } });
+  });
+  return {
+    state,
+    url: () => url,
+    listen: () => new Promise<void>((r) => server.listen(0, "127.0.0.1", () => ((url = `http://127.0.0.1:${(server.address() as { port: number }).port}`), r()))),
+    close: () => new Promise<void>((r) => server.close(() => r())),
+  };
+}
 
 function cli(args: string[], extraEnv: Record<string, string> = {}, cwd?: string): Promise<CliResult> {
   return new Promise((res) => {
@@ -34,6 +69,9 @@ describe("git-graph CLI", () => {
   let fx: BasicFixture;
   let close: () => Promise<void>;
   let port: number;
+  let configDir: string;
+  let installId: string;
+  const lanes = fakeLanesServer();
 
   beforeAll(async () => {
     root = realpathSync(mkdtempSync(join(tmpdir(), "lanes-cli-")));
@@ -45,8 +83,10 @@ describe("git-graph CLI", () => {
     }
     process.env.GIT_CONFIG_GLOBAL = cfg;
     fx = makeBasic(root);
-    const configDir = join(root, "cfg");
+    configDir = join(root, "cfg");
+    await lanes.listen();
     const companion = createCompanion({ configDir });
+    installId = readConfig(configDir).installId;
     const l = await companion.listen(0);
     port = l.port;
     close = l.close;
@@ -62,6 +102,7 @@ describe("git-graph CLI", () => {
   }, 120_000);
   afterAll(async () => {
     await close();
+    await lanes.close();
     rmSync(root, { recursive: true, force: true });
   });
 
@@ -83,7 +124,7 @@ describe("git-graph CLI", () => {
     const out = r.json();
     expect(out.ok).toBe(true);
     expect(out.result.refs.some((x: { short: string }) => x.short === "main")).toBe(true);
-    const key = `local:${repoIdFor(realpathSync(fx.repo))}`;
+    const key = `local:${repoIdFor(installId, realpathSync(fx.repo))}`;
     const byKey = await cli(["exec", "repo.status", "--json", JSON.stringify({ repo: key })]);
     expect(byKey.code).toBe(0);
     expect(byKey.json().result.untracked).toEqual(["-dash.txt", "notes with space.txt", "ünïcødé.txt"]);
@@ -122,7 +163,7 @@ describe("git-graph CLI", () => {
 
   it("url prints deep links (local path, key, GitHub)", async () => {
     const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: fx.repo, encoding: "utf8" }).trim();
-    const id = repoIdFor(realpathSync(fx.repo));
+    const id = repoIdFor(installId, realpathSync(fx.repo));
     const r = await cli(["url", "--repo", fx.repo, "--commit", "HEAD", "--branch", "main", "--file", "src/main.ts"]);
     expect(r.code, r.stderr).toBe(0);
     expect(r.stdout.trim()).toBe(`https://lanes.example.com/local/${id}?branch=main&commit=${head}&file=src/main.ts`);
@@ -132,14 +173,31 @@ describe("git-graph CLI", () => {
     expect(viaExec.json().result.url).toBe(`https://lanes.example.com/local/${id}?commit=${head.slice(0, 7)}&compare=${head}`);
   });
 
-  it("open prints a URL with a one-time pairing code in the fragment; GitHub inputs map to /github", async () => {
-    const r = await cli(["open", fx.repo, "--branch", "develop", "--no-browser", "--json"]);
+  it("open registers the companion with the server and adds a claim code until it is paired; GitHub inputs map to /github", async () => {
+    const server = lanes.url();
+    const id = repoIdFor(installId, realpathSync(fx.repo));
+    const r = await cli(["open", fx.repo, "--branch", "develop", "--app-origin", server, "--no-browser", "--json"]);
     expect(r.code, r.stderr).toBe(0);
     const out = r.json();
-    expect(out.url).toMatch(new RegExp(`^https://lanes\\.example\\.com/local/${repoIdFor(realpathSync(fx.repo))}\\?branch=develop&focus-branch=develop#pair=[A-Z2-9]{10}(&companion=\\d+)?$`));
-    const code = out.url.split("#pair=")[1]!.split("&")[0];
-    const res = await fetch(`http://127.0.0.1:${port}/pair`, { method: "POST", headers: { origin: "http://localhost:5173", "content-type": "application/json" }, body: JSON.stringify({ code }) });
-    expect(res.status).toBe(200);
+    expect(out.url).toBe(`${server}/local/${id}?branch=develop&focus-branch=develop#claim=claim-code-1`);
+    expect(out.paired).toBe(false);
+    expect(lanes.state.registrations).toBe(1);
+    // The agent credentials are stored (0600) and never printed.
+    const cfg = readConfig(configDir);
+    expect(cfg.server).toEqual({ url: server, agentId: "companion-test", token: lanes.state.token });
+    if (process.platform !== "win32") expect(statSync(join(configDir, "companion.json")).mode & 0o777).toBe(0o600);
+    expect(readFileSync(join(configDir, "companion.json"), "utf8")).toContain(lanes.state.token);
+    expect(r.stdout + r.stderr).not.toContain(lanes.state.token);
+    // Once the account claimed the code, open links straight to the repository.
+    lanes.state.paired = true;
+    const again = await cli(["open", fx.repo, "--app-origin", server, "--no-browser", "--json"]);
+    expect(again.json()).toMatchObject({ url: `${server}/local/${id}`, paired: true, key: `local:${id}` });
+    expect(lanes.state.registrations).toBe(1);
+    // An unreachable server is a warning, not a failure.
+    const down = await cli(["open", fx.repo, "--app-origin", "http://127.0.0.1:1", "--no-browser", "--json"]);
+    expect(down.code, down.stderr).toBe(0);
+    expect(down.json().url).toBe(`http://127.0.0.1:1/local/${id}`);
+    expect(down.stderr).toContain("warning: could not pair");
     const gh = await cli(["open", "https://github.com/octo/repo/commit/abcdef1234", "--no-browser"]);
     expect(gh.stdout.trim()).toBe("https://lanes.example.com/github/octo/repo?commit=abcdef1234");
     const ghShort = await cli(["open", "octo/repo", "--provider", "github", "--branch", "dev", "--no-browser"]);
@@ -147,11 +205,21 @@ describe("git-graph CLI", () => {
   });
 
   it("compare, pair, run and events", async () => {
-    const cmp = await cli(["compare", "main", "develop", "src/main.ts", "--repo", fx.repo, "--no-browser"]);
+    const cmp = await cli(["compare", "main", "develop", "src/main.ts", "--repo", fx.repo, "--no-pair", "--no-browser"]);
     expect(cmp.code, cmp.stderr).toBe(0);
-    expect(cmp.stdout).toMatch(/\?commit=[0-9a-f]{40}&compare=[0-9a-f]{40}&file=src\/main\.ts#pair=/);
-    const pair = await cli(["pair", "--json"]);
-    expect(pair.json().code).toMatch(/^[A-Z2-9]{10}$/);
+    expect(cmp.stdout.trim()).toMatch(/^https:\/\/lanes\.example\.com\/local\/[\w-]{16}\?commit=[0-9a-f]{40}&compare=[0-9a-f]{40}&file=src\/main\.ts$/);
+    const local = await cli(["pair", "--local", "--json"]);
+    expect(local.json().code).toMatch(/^[A-Z2-9]{10}$/);
+    // `pair` with an existing registration asks for a fresh code (no new registration).
+    const regs = lanes.state.registrations;
+    const pair = await cli(["pair", "--server", lanes.url(), "--no-browser", "--json"]);
+    expect(pair.code, pair.stderr).toBe(0);
+    expect(pair.json()).toMatchObject({ server: lanes.url(), agentId: "companion-test", registered: false, pairUrl: expect.stringContaining("#claim=claim-code-") });
+    expect(pair.stdout).not.toContain(lanes.state.token);
+    expect(lanes.state.registrations).toBe(regs);
+    // Without a server registration for that URL it registers.
+    const human = await cli(["pair", "--server", `${lanes.url()}/`, "--no-browser"]);
+    expect(human.stdout).toContain("#claim=claim-code-");
     const run = await cli(["run", "--repo", fx.repo, "--", "rev-parse", "--abbrev-ref", "HEAD"]);
     expect(run.code).toBe(0);
     const runFail = await cli(["run", "--repo", fx.repo, "--", "rev-parse", "--verify", "-q", "nope"]);

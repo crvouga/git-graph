@@ -2,9 +2,12 @@
 import { expect, test, type Page } from "@playwright/test";
 import { mkdirSync, readFileSync, writeFileSync, realpathSync } from "node:fs";
 import { join } from "node:path";
-import { git, openLocal, state } from "./harness.ts";
+import { AUTH_STATE, git, openLocal, state } from "./harness.ts";
 import { dismissToasts, focusedRowSubject, MOD, palette, row, waitForGraph } from "./util.ts";
 import { makeBasic, makeConflict } from "../fixtures/make-fixtures.ts";
+
+// Local repositories (and browser-opened folders) sync through the signed-in account.
+test.use({ storageState: AUTH_STATE });
 
 async function runCommand(page: Page, text: string) {
   await palette(page, text);

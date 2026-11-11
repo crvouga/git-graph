@@ -119,6 +119,8 @@ export async function startStack(opts: StackOptions = {}): Promise<Stack> {
     databaseUrl: db.url,
     databaseSchema: schema,
     databasePoolMax: 3,
+    // PGlite's socket server mixes up pipelined queries ("bind message supplies 2 parameters…").
+    databaseMaxPipeline: 1,
     tokenEncryptionKey: TOKEN_KEY,
     appOrigin: ORIGIN,
     githubClientId: f.opts.clientId,

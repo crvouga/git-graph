@@ -173,7 +173,14 @@ export function Banners() {
               </a>
             </div>
           </Show>
-          <Show when={app.view().repo?.provider === "local"}>
+          <Show when={err()!.code === "UNAUTHENTICATED" && app.view().repo?.provider !== "github" && app.auth.loginEnabled && !app.auth.authenticated}>
+            <div class="mt-2">
+              <a class="text-link underline" href={app.loginUrl()}>
+                Sign in
+              </a>
+            </div>
+          </Show>
+          <Show when={app.view().repo?.provider === "local" && app.auth.authenticated}>
             <div class="mt-2">
               <button class="text-link underline" onClick={() => invoke("companion.connect")}>
                 Connect local companion…
@@ -193,14 +200,9 @@ export function Banners() {
   );
 }
 
-/** The application: session check, companion pairing and opening the repository in the URL. */
+/** The application. Everything it shows comes from Zero; a companion pairing code may be in the URL. */
 export function App() {
-  onMount(() => {
-    void app.checkSession();
-    void app.pairFromFragment().then(() => {
-      if (app.view().repo) void app.openRepo(app.view());
-    });
-  });
+  onMount(() => app.claimFromFragment());
   return <AppShell />;
 }
 
@@ -217,11 +219,6 @@ export function AppShell() {
         <div class="relative flex min-h-0 flex-1 flex-col">
           <Show when={!app.repo.error}>
             <GraphView />
-          </Show>
-          <Show when={app.repo.loading && !app.rows.length}>
-            <div class="absolute top-12 left-1/2 -translate-x-1/2 opacity-70" role="status">
-              Loading repository…
-            </div>
           </Show>
           <Show when={app.find.open}>
             <FindWidget />

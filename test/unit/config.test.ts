@@ -58,4 +58,28 @@ describe("loadConfig", () => {
     expect(loadConfig(base).githubClientId).toBeNull();
     expect(() => loadConfig({ ...base, GITHUB_CLIENT_ID: prod.GITHUB_CLIENT_ID })).toThrow("GITHUB_CLIENT_SECRET");
   });
+
+  it("only writes into a dedicated, non-system PostgreSQL schema", () => {
+    expect(loadConfig(prod).databaseSchema).toBe("lanes");
+    for (const schema of ["public", "pg_catalog", "information_schema", "pg_toast", "PG_CATALOG", "lanes; drop table accounts", "1lanes"]) {
+      expect(() => loadConfig({ ...prod, DATABASE_SCHEMA: schema }), schema).toThrow("DATABASE_SCHEMA");
+    }
+  });
+
+  it("keeps zero-cache's own schemas out of public and away from the app schema", () => {
+    expect(loadConfig(prod).zero?.appId).toBe("lanes_zero");
+    expect(() => loadConfig({ ...prod, ZERO_APP_ID: "public" })).toThrow("ZERO_APP_ID");
+    expect(() => loadConfig({ ...prod, ZERO_APP_ID: "lanes" })).toThrow("ZERO_APP_ID");
+    expect(() => loadConfig({ ...prod, DATABASE_SCHEMA: "lanes_0_0", ZERO_APP_ID: "lanes_0" })).toThrow("ZERO_APP_ID");
+  });
+
+  it("requires a shared key when an external zero-cache (sidecar) is configured", () => {
+    const cacheUrl = "http://lanes-zero.railway.internal:4848/";
+    expect(() => loadConfig({ ...prod, ZERO_CACHE_URL: cacheUrl })).toThrow("ZERO_API_KEY");
+    expect(() => loadConfig({ ...prod, ZERO_CACHE_URL: "not a url", ZERO_API_KEY: "k".repeat(32) })).toThrow("ZERO_CACHE_URL");
+    const c = loadConfig({ ...prod, ZERO_CACHE_URL: cacheUrl, ZERO_API_KEY: "k".repeat(32) });
+    expect(c.zero?.cacheUrl).toBe(cacheUrl.replace(/\/+$/, ""));
+    expect(c.zero?.apiKey).toBe("k".repeat(32));
+    expect(loadConfig({ ...prod, ZERO_CACHE_URL: cacheUrl, LANES_ZERO_API_KEY: "v".repeat(32) }).zero?.apiKey).toBe("v".repeat(32));
+  });
 });

@@ -46,6 +46,12 @@ Repository keys: `github:<owner>:<repo>`, `local:<id>` (from `local.open {path}`
 - `pnpm check`, `pnpm test`, `pnpm test:e2e` (production build). Fixtures: `node test/fixtures/make-fixtures.ts [--large]`.
 - Erasable TypeScript only (Node runs `.ts` directly); import local files with `.ts` extensions.
 - Commands live in `src/core/commands/` — add a command there, not in a single interface.
+- The web client's only data path is Zero (`src/zero/`: schema, synced queries, mutators; server
+  side in `src/server/zero/`, source agents in `src/agent/`). New data the UI shows is a query or a
+  `reads` row an agent fills; new actions are mutators or queued operations. No `fetch` for data
+  from `src/web/`, and no loading spinners: render what is synced. Read [docs/architecture.md](docs/architecture.md#zero-sync).
+- Local development needs PostgreSQL with `wal_level=logical` (see [docs/deploy.md](docs/deploy.md#zero-sync));
+  `LANES_ZERO_TEST_DB` enables the end-to-end sync test.
 - UI elements have stable roles/labels (`grid` "Commit graph…", `row` with `data-hash`, `region` "Commit details",
   `tree` "Changed files", `combobox` in the palette). Prefer them in Playwright.
 
@@ -72,11 +78,13 @@ that can alter what is rendered:
   Queue it right away: `gh pr merge --auto --squash`.
 - Every push to `main` publishes the image `ghcr.io/crvouga/chrisvouga-lanes` and deploys it
   (`.github/workflows/publish.yml`, the shared workflow from `crvouga/personal`). See [docs/deploy.md](docs/deploy.md).
-- The server keeps no local state: no disk writes, sessions in the sealed cookie, durable data only in
+- The server keeps no durable local state: no volume, sessions in the sealed cookie, durable data only in
   PostgreSQL (raw parameterized SQL, schema `lanes`, append-only migrations in `src/server/migrations.ts`).
   Sign-in is the shared auth relay (OIDC); GitHub is a connected account (`src/server/auth.ts`).
-  Shared infra (Vault, PostgreSQL, R2 object store, hosting, Google sign-in):
-  https://www.chrisvouga.dev/llms-infra.txt
+  Shared cloud infrastructure (Vault, PostgreSQL, R2 object store, hosting, Google sign-in):
+  https://www.chrisvouga.dev/llms-cloud.txt
+  Local development machines and fleet setup: https://www.chrisvouga.dev/llms-local.txt
+  (index: https://www.chrisvouga.dev/llms-infra.txt)
 - GitHub settings (merge methods, branch rules, security) live in `.github/repo-settings.json`.
   Change them there, then `pnpm github:plan` / `pnpm github:apply`. Don't change them in the GitHub UI;
   the weekly drift check fails if you do. To add a CI job to the gate, add it to `ci-ok.needs`.

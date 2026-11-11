@@ -1,16 +1,16 @@
 // Keyboard-only workflow: no mouse events from first load to closing nested views.
 import { expect, test } from "@playwright/test";
-import { cli, state } from "./harness.ts";
+import { AUTH_STATE, state } from "./harness.ts";
 import { focusedRowSubject, MOD, waitForGraph } from "./util.ts";
+
+test.use({ storageState: AUTH_STATE });
 
 test("open, navigate, details, diff, focus restoration, multi-select, compare — keyboard only", async ({ page }) => {
   const s = state();
   page.on("pageerror", (e) => console.log("PAGEERROR", e.message, e.stack?.split("\n").slice(0, 4).join(" | ")));
   page.on("console", (m) => m.type() === "error" && console.log("CONSOLEERR", m.text()));
-  // Fresh launch on the home screen, paired through the one-time fragment code (as `git-graph open` does).
-  const code = JSON.parse(cli(["pair", "--json"])).code as string;
-  await page.goto(`${s.appOrigin}/#pair=${code}&companion=${s.companionPort}`);
-  await expect(page.getByText("Connected to the local git-graph companion")).toBeVisible();
+  // Fresh launch on the home screen, signed in to the account the companion is paired with.
+  await page.goto(`${s.appOrigin}/`);
 
   // Open the repository by path from the palette.
   await page.keyboard.press(`${MOD}+Shift+P`);
@@ -39,7 +39,9 @@ test("open, navigate, details, diff, focus restoration, multi-select, compare �
   await expect(details).toBeVisible();
   await expect(page).toHaveURL(/commit=[0-9a-f]{40}/);
 
-  // Tab into files, Enter opens the diff, Escape returns focus to that file.
+  // Tab into files, Enter opens the diff, Escape returns focus to that file. (Details are a synced
+  // read: wait for the files before tabbing into them.)
+  await expect(details.locator(".files [role=treeitem]").first()).toBeVisible();
   await page.keyboard.press("Tab");
   await expect(page.locator(".files [role=treeitem]:focus")).toBeVisible();
   await page.keyboard.press("ArrowDown"); // src/ → util.ts
