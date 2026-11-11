@@ -12,7 +12,7 @@
 
 import { executeCommand, type CommandRegistry } from "../core/commands/registry.ts";
 import type { RepositoryPort } from "../core/port.ts";
-import { AppError, type Capabilities, type Commit, type HistoryQuery, type RefsSnapshot, type RepoInfo, type WorkingTreeStatus } from "../core/types.ts";
+import { AppError, type Capabilities, type Commit, type HistoryPage, type HistoryQuery, type RefsSnapshot, type RepoInfo, type WorkingTreeStatus } from "../core/types.ts";
 import type { ErrorJson, RepoSync } from "../zero/schema.ts";
 import { errorJson, stableJson } from "../zero/rows.ts";
 
@@ -115,8 +115,13 @@ export class RepoSyncer {
   ensure(depth: number): Promise<void> {
     return this.serial(async () => {
       if (this.closed) return;
-      if (!this.started) await this.start();
-      await this.fill(depth);
+      if (!this.started) {
+        // Read the first page while the repository, refs and status are published: on a large
+        // history git takes a while to produce it, and it is what the viewer is waiting for.
+        const first = this.cursor === null && !this.complete ? this.port.history(ALL_HISTORY, null, PAGE).then((p) => ({ p }), (e: unknown) => ({ e })) : null;
+        await this.start();
+        await this.fill(depth, first);
+      } else await this.fill(depth);
     });
   }
 
@@ -136,9 +141,15 @@ export class RepoSyncer {
     });
   }
 
-  private async fill(depth: number) {
+  private async fill(depth: number, first?: Promise<{ p: HistoryPage } | { e: unknown }> | null) {
     while (!this.complete && this.written < depth && !this.closed) {
-      const page = await this.port.history(ALL_HISTORY, this.cursor, Math.min(PAGE, Math.max(100, depth - this.written)));
+      let page: HistoryPage;
+      if (first) {
+        const r = await first;
+        first = null;
+        if ("e" in r) throw r.e;
+        page = r.p;
+      } else page = await this.port.history(ALL_HISTORY, this.cursor, Math.min(PAGE, Math.max(100, depth - this.written)));
       this.cursor = page.cursor;
       const fresh = page.commits.filter((c) => !this.known.has(c.hash));
       this.complete = page.cursor === null;

@@ -405,8 +405,10 @@ function createApp() {
     }),
   );
 
-  // Commits → worker, as deltas against what this session already sent.
+  // Commits → worker, as deltas against what this session already sent. Re-runs when a new
+  // session starts: the rows may have been delivered just before the reset cleared them.
   createComputed(() => {
+    sessionSig();
     const list = commitRows.data();
     const id = repoId();
     if (!list || !id) return;
@@ -428,6 +430,7 @@ function createApp() {
 
   // Repository row, refs and the view's query → store and worker.
   createComputed(() => {
+    sessionSig();
     const r = repoRow.data();
     const id = repoId();
     const refList = refRows.data();
