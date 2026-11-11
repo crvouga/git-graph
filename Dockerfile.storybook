@@ -1,0 +1,20 @@
+# syntax=docker/dockerfile:1
+# Storybook for Lanes, as a static site for review (gitty-storybook.chrisvouga.dev).
+# No build args or secrets. Stories run Zero offline in memory, so the site needs no server.
+#   docker build -f Dockerfile.storybook -t lanes-storybook .
+#   docker run --rm -p 8080:80 lanes-storybook
+
+FROM node:24-bookworm-slim AS build
+WORKDIR /app
+ENV PNPM_HOME=/pnpm PATH=/pnpm:$PATH CI=1
+# git: the Storybook build generates the stories' fixture repository with it.
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+ && rm -rf /var/lib/apt/lists/* && corepack enable
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+RUN --mount=type=cache,id=pnpm,target=/pnpm/store pnpm install --frozen-lockfile
+COPY . .
+RUN pnpm storybook:build
+
+FROM nginx:1.27-alpine
+COPY --from=build /app/storybook-static /usr/share/nginx/html
+EXPOSE 80
