@@ -130,10 +130,13 @@ export class RepoSyncer {
     this.info = info;
     this.caps = caps;
     await this.o.writer.repo(this.repoId, info, caps);
-    await this.o.writer.refs(this.repoId, refs);
+    // The rest only needs the repository row; each write is a round trip, so send them together.
+    await Promise.all([
+      this.o.writer.refs(this.repoId, refs),
+      caps.workingTree.available ? this.publishStatus() : null,
+      this.o.writer.state(this.repoId, { sync: { state: (this.o.live ?? caps.watch.available) ? "live" : "polling", lastSuccessAt: Date.now(), lastError: null } }),
+    ]);
     this.refs = refs;
-    if (caps.workingTree.available) await this.publishStatus();
-    await this.o.writer.state(this.repoId, { sync: { state: (this.o.live ?? caps.watch.available) ? "live" : "polling", lastSuccessAt: Date.now(), lastError: null } });
     this.started = true;
     this.unsub = this.port.subscribe((e) => {
       if (e.type === "sync.failed") return void this.o.writer.state(this.repoId, { sync: { lastError: e.reason } }).catch(() => {});
