@@ -4,7 +4,7 @@
 #   docker build -t lanes .
 #   docker run --rm -p 8787:8787 -e APP_ORIGIN=http://localhost:8787 -e SESSION_SECRET="$(openssl rand -base64 48)" lanes
 
-FROM node:24-bookworm-slim AS build
+FROM node:26-bookworm-slim AS build
 WORKDIR /app
 ENV PNPM_HOME=/pnpm PATH=/pnpm:$PATH CI=1
 RUN corepack enable
@@ -15,14 +15,14 @@ RUN pnpm build
 
 # zero-cache (Zero's sync server, run by the server as a child process) with its native SQLite.
 # Pinned to the @rocicorp/zero version the app is built with.
-FROM node:24-bookworm-slim AS zero
+FROM node:26-bookworm-slim AS zero
 WORKDIR /zero
 COPY package.json /tmp/package.json
 RUN ZERO_VERSION="$(node -p "require('/tmp/package.json').dependencies['@rocicorp/zero']")" \
  && npm init -y >/dev/null \
  && npm install --omit=dev --no-audit --no-fund "@rocicorp/zero@${ZERO_VERSION}"
 
-FROM node:24-bookworm-slim AS runtime
+FROM node:26-bookworm-slim AS runtime
 ENV NODE_ENV=production \
     PORT=8787 \
     HOST=0.0.0.0 \
