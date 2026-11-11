@@ -33,6 +33,10 @@ test("100k-commit history stays fast and responsive", async ({ page, context }) 
   await page.goto(url, { waitUntil: "commit" });
   await shown('[role="row"][data-row="0"]');
   results.firstVisibleCommitsMs = Date.now() - t0;
+  // Where the first load spent its time (ms since navigation start).
+  results.firstLoadMarks = JSON.stringify(
+    await page.evaluate(() => Object.fromEntries(performance.getEntriesByType("mark").filter((m) => m.name.startsWith("lanes:")).map((m) => [m.name.slice(6), Math.round(m.startTime)]))),
+  );
   await page.getByRole("grid").focus();
   await page.keyboard.press("ArrowDown");
   await shown('[role="row"][data-row="1"].kb');

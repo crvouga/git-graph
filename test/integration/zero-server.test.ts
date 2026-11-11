@@ -16,6 +16,8 @@ let mutators: ReturnType<typeof createServerMutators>;
 let alice: string;
 let bob: string;
 
+/** Server log lines, shown when a wait times out. */
+const logs: string[] = [];
 const KEY = "github:octo:basic";
 const SECRET = "github:octo:secret";
 
@@ -27,6 +29,7 @@ beforeAll(async () => {
       // PGlite serves one connection at a time; concurrent pooled connections confuse its socket server.
       databasePoolMax: 1,
       log: (l: string, m: string, e?: unknown) => {
+        logs.push(`${new Date().toISOString()} ${l} ${m} ${JSON.stringify(e) ?? ""}`);
         if (process.env.ZDEBUG) console.log("LOG", l, m, JSON.stringify(e));
       },
       zero: { cacheUrl: "http://127.0.0.1:9", port: 0, upstreamDb: "", cvrDb: null, changeDb: null, appId: "lanes_zero", apiKey: "test-key", adminPassword: "x", replicaFile: "", logLevel: "warn", numSyncWorkers: null },
@@ -61,7 +64,10 @@ async function until<T>(fn: () => Promise<T | null | undefined | false>, what: s
   for (;;) {
     const v = await fn();
     if (v) return v;
-    if (Date.now() - t0 > ms) throw new Error(`timed out: ${what}`);
+    if (Date.now() - t0 > ms) {
+      const state = await q(`select 'demand' as kind, id, state, error::text as detail from $S.demands where repo_id like 'github:%' union all select 'repo', id, history_complete::text, commit_count::text from $S.repos where id like 'github:%'`).catch((e: unknown) => [String(e)]);
+      throw new Error(`timed out: ${what}\nstate: ${JSON.stringify(state)}\nserver log:\n${logs.slice(-40).join("\n")}`);
+    }
     await new Promise((r) => setTimeout(r, 50));
   }
 }

@@ -14,7 +14,7 @@ import type { EngineEvent, SyncInfo } from "../engine/protocol.ts";
 import { address } from "./address.ts";
 import { IN_STORYBOOK } from "./env.ts";
 import { requestRead, serveBrowserRepo } from "./sync.ts";
-import { boot, connection, live, mutate, zero } from "./zero.ts";
+import { boot, connection, live, markOnce, mutate, zero } from "./zero.ts";
 
 /** A repository as Zero syncs it (src/zero/schema.ts). */
 interface RepoRow {
@@ -412,6 +412,7 @@ function createApp() {
     const list = commitRows.data();
     const id = repoId();
     if (!list || !id) return;
+    if (list.length) markOnce("lanes:first-commits");
     const add: Commit[] = [];
     const seen = new Set<string>();
     for (const r of list) {
@@ -435,6 +436,7 @@ function createApp() {
     const id = repoId();
     const refList = refRows.data();
     if (!id || !r || r.id !== id) return;
+    markOnce("lanes:repo-row");
     if (repo.error?.code === "NOT_FOUND") setRepo("error", null);
     const snap = snapshotOf(r.head, r.refs_version, (refList ?? []).filter((x) => x.repo_id === id));
     const synced = commitRows.data()?.length ?? 0;
@@ -541,6 +543,7 @@ function createApp() {
       case "rows": {
         const anchor = captureAnchor();
         rows.apply(ev);
+        if (rows.length) markOnce("lanes:first-rows");
         setRowsVersion((x) => x + 1);
         if (ev.kind !== "append") {
           checkMissingRefs(ev.refs);

@@ -102,11 +102,17 @@ export function live<T>(query: () => unknown, opts: { ttl?: "none" | `${number}s
   return { data, type };
 }
 
+/** A performance mark for the first time something happens on this page (read by the perf test). */
+export function markOnce(name: string): void {
+  if (performance.getEntriesByName(name, "mark").length === 0) performance.mark(name);
+}
+
 /** Zero's connection state, as a signal (for the sync indicator). */
 export const [connection, setConnection] = createSignal<{ name: string; reason?: string }>({ name: IN_STORYBOOK ? "connected" : "connecting" });
 if (!IN_STORYBOOK) {
   zero.connection.state.subscribe((s) => {
     setConnection(s as { name: string; reason?: string });
+    if ((s as { name: string }).name === "connected") markOnce("lanes:zero-connected");
     // A session that ended (sign-out elsewhere, expiry): reload to start over as who we are now.
     if ((s as { name: string }).name === "needs-auth") location.reload();
   });
