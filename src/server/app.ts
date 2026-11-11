@@ -76,7 +76,7 @@ export function createServerApp(config: ServerConfig): ServerApp {
 
   // Durable state: PostgreSQL (accounts, connected GitHub, and every Zero-synced table).
   const signInConfigured = !!(config.oidc && config.databaseUrl && config.tokenEncryptionKey);
-  const db = config.databaseUrl ? connectDb(config.databaseUrl, { schema: config.databaseSchema, max: config.databasePoolMax }) : null;
+  const db = config.databaseUrl ? connectDb(config.databaseUrl, { schema: config.databaseSchema, max: config.databasePoolMax, ...(config.databaseMaxPipeline ? { maxPipeline: config.databaseMaxPipeline } : {}) }) : null;
   const accounts = db && signInConfigured ? new AccountStore(db, new TokenBox(config.tokenEncryptionKey!)) : null;
   const oidc = signInConfigured ? new Oidc({ ...config.oidc!, fetch: config.fetch }) : null;
   // Migrate at boot, retrying with back-off: a database outage must not crash-loop the server

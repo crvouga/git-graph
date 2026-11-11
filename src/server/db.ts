@@ -27,6 +27,8 @@ export interface DbOptions {
   /** Pool size (small: one Node process). */
   max?: number;
   statementTimeoutMs?: number;
+  /** Queries sent on one connection before the first answers (1 = one at a time). Default 100. */
+  maxPipeline?: number;
 }
 
 const IDENT = /^[a-z_][a-z0-9_]{0,62}$/;
@@ -52,6 +54,7 @@ export function connectDb(url: string, opts: DbOptions): Db {
   const schema = quoteIdent(opts.schema);
   const sql = postgres(url, {
     max: opts.max ?? 5,
+    ...(opts.maxPipeline ? { max_pipeline: opts.maxPipeline } : {}),
     idle_timeout: 30,
     connect_timeout: 10,
     onnotice: false,

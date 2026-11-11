@@ -47,6 +47,8 @@ export interface ServerConfig {
   /** Lanes' allocated schema (never `public` or a PostgreSQL system schema). */
   databaseSchema: string;
   databasePoolMax: number;
+  /** Queries pipelined per connection (tests set 1: PGlite's socket server answers one at a time). */
+  databaseMaxPipeline?: number;
   migrateOnBoot: boolean;
   /** Encrypts GitHub tokens stored in PostgreSQL (≥ 32 bytes). */
   tokenEncryptionKey: string | null;
