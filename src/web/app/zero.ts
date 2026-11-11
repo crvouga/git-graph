@@ -40,7 +40,7 @@ export const STORYBOOK_ACCOUNT = "00000000-0000-4000-8000-00000000057b";
 
 export const boot: Boot = IN_STORYBOOK ? { accountId: STORYBOOK_ACCOUNT, loginEnabled: true, githubEnabled: true, server: false } : readBoot();
 
-const context: ZeroContext = { accountId: boot.accountId, agentId: null };
+const context: ZeroContext = { accountId: boot.accountId, agentId: null, trustedStore: true };
 
 export const zero = new Zero({
   // Offline in Storybook: every query is answered by the in-memory store, nothing is pushed.
