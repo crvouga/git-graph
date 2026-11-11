@@ -25,9 +25,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: pnpm
@@ -51,9 +51,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: pnpm
@@ -61,7 +61,7 @@ jobs:
       - name: Playwright version
         id: pw
         run: echo "version=$(pnpm exec playwright --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         id: pw-cache
         with:
           path: ~/.cache/ms-playwright
@@ -80,7 +80,7 @@ jobs:
           docker exec -e PGPASSWORD=pass pg psql -h 127.0.0.1 -U postgres -Atqc "select 1 from pg_namespace where nspname = 'lanes'" | grep -qx 1
           echo "LANES_ZERO_TEST_DB=postgres://postgres:pass@localhost:55432/postgres" >> "$GITHUB_ENV"
       - run: pnpm test:e2e
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: e2e-results
@@ -95,9 +95,9 @@ jobs:
     timeout-minutes: 20
     needs: [test]
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: pnpm
@@ -108,13 +108,13 @@ jobs:
           PORT=8799 APP_ORIGIN=http://127.0.0.1:8799 SESSION_SECRET=ci-secret-ci-secret-ci-secret-0123456789 node dist/server/server.mjs &
           for _ in $(seq 1 30); do curl -fsS http://127.0.0.1:8799/health && break; sleep 0.5; done
           curl -fsS http://127.0.0.1:8799/github/octo/repo | grep -q '<div id="app">'
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: lanes-dist
           path: dist/
           retention-days: 14
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
         with:
           context: .
           push: false
@@ -141,11 +141,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0 # ui:compare builds the PR's base commit
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: pnpm
@@ -153,7 +153,7 @@ jobs:
       - name: Playwright version
         id: pw
         run: echo "version=$(pnpm exec playwright --version | awk '{print $2}')" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         id: pw-cache
         with:
           path: ~/.cache/ms-playwright
@@ -168,7 +168,7 @@ jobs:
         run: pnpm ui:compare --base ${{ github.event.pull_request.base.sha }}
       - if: github.event_name != 'pull_request'
         run: pnpm ui:shots --out .ui-shots/after --check
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: ui-shots
@@ -187,8 +187,8 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
       - name: Vault token (GitHub OIDC, role github-actions)
