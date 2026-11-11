@@ -187,6 +187,14 @@ webhook URL is `https://lanes.chrisvouga.dev/webhooks/github`. The relay client'
 Redeploy a given commit (a human, from a machine with access to `crvouga/personal`):
 `gh workflow run deploy.yml -R crvouga/personal -f action=deploy -f service_id=lanes -f image_tag=<sha>`.
 
+## Storybook: `gitty-storybook.chrisvouga.dev`
+
+The component Storybook is published for review as its own static service. Every push to `main`
+builds `Dockerfile.storybook` (`pnpm storybook:build`, served by nginx on port 80, health `/`)
+into `ghcr.io/crvouga/chrisvouga-gitty-storybook` through the `gitty_storybook` job in
+`.github/workflows/publish.yml`. Stories run Zero offline in memory, so it needs no secrets, database or
+server. The service entry lives in `crvouga/personal` like `lanes`.
+
 ## 1. Create the GitHub App
 
 Follow [github-app.md](github-app.md). You need the client id, client secret and webhook secret.
